@@ -1,0 +1,21 @@
+{
+  "W": 36,
+  "n_rl_days": 6,
+  "n_rl_slots": 2,
+  "B": 50,
+  "epsilon_0": 0.1,
+  "gamma_bar": 0.5,
+  "target_update_C": 1,
+  "p_rl": 77,
+  "b_hat_stored_value_type": "rl_b_hat",
+  "b_tilde_stored_value_type": "rl_b_tilde",
+  "pf_state_stored_value_type": "rl_pf_state",
+  "pf_state_history_stored_value_type_prefix": "rl_pf_state_week",
+  "standardize_context": true,
+  "std_params_path": "std_params.json",
+  "rl_prior_path": "rl_priors.json",
+  "rl_q_prior_path": "rl_q_priors.json",
+  "J_particles": 50,
+  "sigma2_rl": 1.0,
+  "seed": null
+}
