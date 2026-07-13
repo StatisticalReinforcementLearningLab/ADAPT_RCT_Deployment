@@ -52,6 +52,7 @@ from RL_agents.rl.algorithm_helpers import (
     ensemble_action_prob,
     phi_action_feature_names,
 )
+from RL_agents.rl.ew_helpers import compute_ew_hat, load_ew_coefs
 from RL_agents.rl.pf_helpers import initial_pf_state, latest_pf_packet, update_pf_belief
 from RL_agents.rl.prior_helpers import load_pf_priors, load_q_prior
 from RL_agents.rl.standardization import load_std_params, standardize_context
@@ -85,6 +86,7 @@ DEFAULT_B_HAT_STORED_VALUE_TYPE = "rl_b_hat"
 DEFAULT_B_TILDE_STORED_VALUE_TYPE = "rl_b_tilde"
 DEFAULT_PF_STATE_STORED_VALUE_TYPE = "rl_pf_state"
 DEFAULT_PF_STATE_HISTORY_STORED_VALUE_TYPE_PREFIX = "rl_pf_state_week"
+DEFAULT_EW_STORED_VALUE_TYPE = "rl_E_w"
 
 
 def _resolve_local_path(path_value: str | Path | None) -> Path | None:
@@ -159,6 +161,11 @@ class RL(ActionHandlerBase):
         pf_loaded = load_pf_priors(_resolve_local_path(self.config.get("rl_prior_path")))
         self.pf_priors, self.pf_prior_source = (
             pf_loaded if pf_loaded is not None else ({}, None)
+        )
+        self.ew_coefs = load_ew_coefs(
+            _resolve_local_path(
+                self.config.get("ew_coefs_path", "Ew_pooled_linear_coefs.json")
+            )
         )
 
     def _rng(self, model_params: dict) -> np.random.Generator:
@@ -304,6 +311,15 @@ class RL(ActionHandlerBase):
             # internal 0-indexed RL week k = w - 1 at the boundary; internals stay
             # 0-indexed.
             context_for_state = external_week_to_internal_k(context)
+            # Perceived utility E_w: if the request context omits it, fall back to
+            # the value written weekly by prepare_for_update's E_w update.
+            if (
+                context_for_state.get("E_w") is None
+                and context_for_state.get("perceivedUtility") is None
+            ):
+                ew_stored = stored_float(db_reader, self._ew_stored_value_type())
+                if ew_stored is not None:
+                    context_for_state = {**context_for_state, "E_w": ew_stored}
             if self.std_params is not None:
                 context_for_state = standardize_context(
                     context_for_state, self.std_params
@@ -489,6 +505,65 @@ class RL(ActionHandlerBase):
                 ),
             ),
         )
+
+    def _ew_stored_value_type(self) -> str:
+        return str(
+            self.config.get("ew_stored_value_type", DEFAULT_EW_STORED_VALUE_TYPE)
+        )
+
+    def _ew_inputs(self, observations: list, packet: dict | None) -> dict | None:
+        """Locate the weekly E_w predictor aggregates for the perceived-utility update.
+
+        The server assembles these from the database for the just-finalized week.
+        Accepted locations: ``packet["ew_inputs"]``, an observation payload with an
+        ``ew_inputs`` dict, or an observation of type ``rl_ew_inputs``.
+        """
+        if packet is not None and isinstance(packet.get("ew_inputs"), dict):
+            return packet["ew_inputs"]
+        for obs in observations:
+            payload = getattr(obs, "payload", {}) or {}
+            if isinstance(payload.get("ew_inputs"), dict):
+                return payload["ew_inputs"]
+            if getattr(obs, "observation_type", None) == "rl_ew_inputs" and payload:
+                return payload
+        return None
+
+    def _prepare_ew_update(
+        self,
+        user_id: str,
+        observations: list,
+        packet: dict | None,
+    ) -> list[StoredValue] | None:
+        """Weekly perceived-utility (E_w) update from pooled linear coefficients.
+
+        Returns a stored value for the updated E_w (consumed by ``make_state`` for
+        the next week's decisions), or ``None`` if coefficients or inputs are
+        unavailable. Failures emit a yellow alert and return ``None``.
+        """
+        if self.ew_coefs is None:
+            return None
+        inputs = self._ew_inputs(observations, packet)
+        if inputs is None:
+            return None
+        try:
+            ew_hat = compute_ew_hat(self.ew_coefs, inputs)
+        except Exception as exc:
+            log_alert(
+                logger,
+                YELLOW,
+                "perceived-utility (E_w) update failed",
+                action_type=self.action_type,
+                user_id=str(user_id),
+                error=str(exc),
+            )
+            return None
+        return [
+            StoredValue(
+                user_id=str(user_id),
+                type=self._ew_stored_value_type(),
+                value=float(ew_hat),
+            )
+        ]
 
     def _model_params_from_reader(self, db_reader: DBReader) -> dict | None:
         if db_reader is None:
@@ -785,6 +860,12 @@ class RL(ActionHandlerBase):
                     reason="pf_update_failed",
                     error=str(exc),
                 )
+
+        # Weekly perceived-utility (E_w) update; independent of the PF/belief path.
+        ew_stored = self._prepare_ew_update(user_id, observations, packet)
+        if ew_stored:
+            stored_values = [*(stored_values or []), *ew_stored]
+
         return UpdatePrepResult(
             rewards=rewards,
             stored_values=stored_values,

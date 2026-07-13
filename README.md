@@ -25,13 +25,15 @@ RL_agents/
     |-- RL.py                # Walking-suggestion RLSVI handler
     |-- algorithm_helpers.py # Feature construction and RLSVI math
     |-- pf_helpers.py        # Particle-filter belief updates
+    |-- ew_helpers.py        # Perceived-utility (E_w) pooled-linear update
     |-- prior_helpers.py     # Prior loading helpers
     |-- state_helpers.py     # State coercion, validation, serialization
     |-- standardization.py   # Optional context standardization
     |-- config.json          # RL policy settings
     |-- rl_priors.json       # Particle-filter prior parameters
     |-- rl_q_priors.json     # RLSVI Q-function prior parameters
-    `-- std_params.json      # Context standardization parameters
+    |-- std_params.json      # Context standardization parameters
+    `-- Ew_pooled_linear_coefs.json  # Perceived-utility (E_w) weights
 ```
 
 ## Runtime Requirements
@@ -246,6 +248,10 @@ the framework stored values named in `rl/config.json`:
 
 At baseline week `k = 0`, missing beliefs default to `0.0`.
 
+If `E_w`/`perceivedUtility` is missing from the context, `make_state(...)` reads
+the perceived utility from the stored value `rl_E_w`, which the weekly E_w update
+in `prepare_for_update(...)` maintains.
+
 ### Minimal RL Context Example
 
 ```python
@@ -278,8 +284,12 @@ The deployment framework typically calls updates in two phases.
    - reads recent observations from `db_reader.get_observations()`
    - extracts explicit rewards from observation payloads containing
      `action_id` plus `reward`, `CAE`, or `cae`
-   - consumes the latest particle-filter packet when available
-   - returns rewards, stored belief values, and transformed observations
+   - consumes the latest particle-filter packet when available, runs the
+     particle-filter belief update, refits the online noise variances, and
+     assigns the belief mean `b_hat` as the weekly reward
+   - runs the weekly perceived-utility (`E_w`) update from pooled linear
+     coefficients and stores the result under `rl_E_w`
+   - returns rewards, stored belief/PF/`E_w` values, and transformed observations
 
 2. `update(...)`
 
@@ -294,6 +304,96 @@ The deployment framework typically calls updates in two phases.
 Particle-filter packets are accepted in observation payloads with type
 `rl_pf_packet` or `pf_packet`. A packet can use external `w` or internal `k`;
 external `w` is converted to `k = w - 1`.
+
+## Server-Built Data Contract (PF packet + E_w inputs)
+
+The handler consumes weekly design matrices and aggregates; it does **not** build
+them. The deployment/server side is responsible for assembling them from the
+database for the just-finalized week and delivering them as observation payloads.
+This section specifies exactly what to build.
+
+### Perceived-utility (E_w) inputs
+
+The weekly `E_w` update applies pooled, no-intercept linear coefficients
+(`Ew_pooled_linear_coefs.json`) to five weekly aggregates. Provide them under an
+`ew_inputs` dict, either inside the PF packet (`packet["ew_inputs"]`), inside any
+observation payload (`payload["ew_inputs"]`), or as an observation of type
+`rl_ew_inputs` whose payload is the inputs dict itself.
+
+| Field | Meaning | How to build from the database |
+|-------|---------|--------------------------------|
+| `J_w` | Week-present / survey indicator (0 or 1) | Whether the week's survey was completed |
+| `PV_sum` | Mean of the 14 standardized per-slot pageview counts | `mean(HourlyPageviewCount_norm)` over the 14 decision slots |
+| `FW_sum` | Mean over 7 days of `nextday_wearing` | `nansum(nextday_wearing) / 7` (first row per day) |
+| `PJ_sum` | Mean over 7 days of `daily_present` | `nansum(daily_present) / 7` (first row per day) |
+| `half_J_tool8` *(optional)* | `0.5 * J_w * ((U1+1) + (U2+1)) / 8` | Provide directly, **or** provide `U1`/`U2` (aliases `Exp-tool-1`/`Exp-tool-2`) and the handler derives it (missing ratings default to 0) |
+
+If `ew_inputs` is absent, the E_w update is skipped. If it is present but missing
+`PV_sum`/`FW_sum`/`PJ_sum`, a yellow "perceived-utility (E_w) update failed" alert
+is logged and E_w is left unchanged. The resulting `E_w` is stored under `rl_E_w`
+and used by `make_state` for the following week's decisions when the request
+context omits `E_w`/`perceivedUtility`.
+
+### PF packet
+
+Deliver one packet per completed RL week as an observation with type
+`rl_pf_packet` (or a payload containing `pf_data`/`pf_packet`).
+
+| Packet field | Type | Meaning |
+|--------------|------|---------|
+| `w` or `k` | int | Study week: 1-indexed `w` (converted to `k = w - 1`) or internal 0-indexed `k` |
+| `I_w` | 0/1 | Query arm this week (1 = full CAE observed, 0 = short CAE observed) |
+| `J_w` | 0/1 or null | Week-present gate; if `!= 1`, no CAE outcome is used this week |
+| `Y_prev` / `Y_w` | float or null | Full weekly CAE from the finalized week (used when `I_w = 1`) |
+| `tY_prev` / `tilde_Y_w` | float or null | Short CAE from the finalized week (used when `I_w = 0`) |
+| `action_ids` *(optional)* | list[int] | Action ids of the completed week to receive the belief reward; if omitted, the handler matches actions whose internal week equals `k - 1` |
+| `ew_inputs` *(optional)* | dict | E_w inputs (see above) |
+| `pf_data` | dict | Particle-filter design matrices (see below) |
+
+### `pf_data` fields
+
+Let `K14 = 14` (slots/week), `N_MED_SLOT = 12` (Mon–Sat × 2 slots), and
+`N_MED_ANTIC_DAY = 6` (Mon–Sat). `sim_w_prev = k - 1` is the just-finalized week.
+The two mediator models are index 0 = "fourSC" (per-slot step-count next-4h) and
+index 1 = "antic" (per-day anticipated affect). Cumulative arrays cover weeks
+`0 .. sim_w_prev - 1` and are `null` until `k >= 2`.
+
+Current-week design (always present):
+
+| Field | Shape | Content |
+|-------|-------|---------|
+| `X_MY_base` | `[ (12, p_fourSC), (6, p_antic) ]` | Mediator design rows for the current week with the CAE column zeroed |
+| `cae_delta_MY` | same shapes | Per-row deltas marking where the per-particle CAE is substituted |
+| `M_Y_obs` | `[ (12,), (6,) ]` | Observed mediators (`stepCountNext4Hour`, `dailyAnticipatedAffect`); `NaN` where unobserved |
+| `X_Y_base` | `(24,)` | CAE transition design for the current week (CAE AR slot zeroed) |
+| `cae_delta_Y` | `(24,)` | Zeros except the AR-1 CAE column = 1 |
+| `X_tY_base` | `(2,)` | Short-CAE design, `[1, 0]` |
+| `cae_delta_tY` | `(2,)` | Short-CAE CAE slot, `[0, 1]` |
+| `cae_all_0` | float | Baseline CAE (AR seed) at index 0 |
+| `sim_w_prev` | int | `k - 1` |
+
+Cumulative history (present when `k >= 2`, else `null`):
+
+| Field | Shape | Content |
+|-------|-------|---------|
+| `X_cumul_MY_base` | `[ (n0, p_fourSC), (n1, p_antic) ]` | Mediator rows across past weeks (complete cases) |
+| `cae_delta_cumul_MY` | same shapes | CAE deltas for the cumulative rows |
+| `week_idx_cumul_MY` | `[ (n0,), (n1,) ]` | Week index of each cumulative mediator row (for per-particle CAE lookup) |
+| `y_cumul_MY` | `[ (n0,), (n1,) ]` | Observed mediator responses (finite only) |
+| `X_cumul_Y_base` | `(sim_w_prev, 24)` | CAE transition design for weeks `0 .. sim_w_prev - 1` |
+| `cae_delta_cumul_Y` | `(sim_w_prev, 24)` | AR-1 CAE column = 1 per week |
+| `y_cumul_Y` | `(sim_w_prev,)` | CAE trajectory targets (filled per-particle at update time) |
+| `X_cumul_tY` | `(n_jw, 2)` | Short-CAE design for weeks where `J_w = 1` |
+| `cae_delta_cumul_tY` | `(n_jw, 2)` | Short-CAE CAE slot = 1 |
+| `week_idx_cumul_tY` | `(n_jw,)` | Week index of each short-CAE row |
+| `y_cumul_tY` | `(n_jw,)` | Observed short-CAE outcomes |
+
+The reference construction is `build_pf_data(...)` in the top-level
+`algorithm_helpers.py` (simulation code); the deployment build should reproduce
+the same shapes and column conventions from the participant's logged mediators,
+actions, CAE outcomes, and week indicators. `prepare_for_update` also needs the
+current `model_params` in `db_reader.get_retrieved_data()` under one of
+`model_params`, `current_model_params`, or `rl_model_params` to run the PF update.
 
 ## DBReader Contract
 
