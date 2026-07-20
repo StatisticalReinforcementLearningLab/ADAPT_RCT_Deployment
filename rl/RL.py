@@ -1,5 +1,10 @@
 """Framework-facing RL action handler.
 
+#TODO:
+1. Feature construction in make_state
+2. pf_packet construction in prepare_for_update
+3. how is delayed data handled in prepare_for_update or update
+
 This is the base RL algorithm handler. It is used to train the RL model and to make actions.
 
 Expected state/context fields
@@ -7,18 +12,12 @@ Expected state/context fields
 ``make_state`` accepts a context dict that already contains the feature-builder
 state used by ``RL_agents.rl.algorithm_helpers.build_phi_action``:
 
-    E_w, M_Y, M_E, C, k, d, t
+    E_w, M_Y, M_E, C, w, d, t
 
-. If omitted,
-``make_state`` reads them from ``DBReader.get_stored_value()`` using the stored
-value types in ``config.json``.
-
-``update`` expects action records whose ``state`` includes those same fields and
-a ``rewards`` dict mapping ``action_id`` to the weekly reward available after
-that action. In the usual weekly batch update, rewards are attached to the last
-controlled slot of a completed week; the handler stores that value as
-``b_hat_hist[k + 1]`` and refits the RLSVI ensemble for week ``k + 1`` when the
-necessary historical states are available.
+Study week ``w`` is 1-indexed (``w=1`` is the first week of RL/active phase).
+Array indexing inside this handler uses ``k = w - 1``.
+If omitted,``make_state`` reads beliefs / ``E_w`` from ``DBReader.get_stored_value()``
+using the stored value types in ``config.json``.
 """
 
 from __future__ import annotations
@@ -40,32 +39,41 @@ from RL_agents.base import (
     UpdatePrepResult,
     UpdateResult,
 )
-from RL_agents.logging_config import RED, YELLOW, get_logger, log_alert
+from RL_agents.logging_config import RED, YELLOW, GREEN, get_logger, log_alert
 from RL_agents.rl.algorithm_helpers import (
-    N_RL_DAYS,
-    N_RL_SLOTS,
     build_phi_action,
     build_rl_training_data,
     clip_prob,
     compute_rlsvi_betas,
     empirical_bayes_sigma2_ensemble,
     ensemble_action_prob,
+    gamma_dt_matrix,
     phi_action_feature_names,
 )
 from RL_agents.rl.ew_helpers import compute_ew_hat, load_ew_coefs
-from RL_agents.rl.pf_helpers import initial_pf_state, latest_pf_packet, update_pf_belief
-from RL_agents.rl.prior_helpers import load_pf_priors, load_q_prior
+from RL_agents.rl.pf_helpers import (
+    initial_pf_state,
+    latest_pf_packet,
+    resolve_pf_priors,
+    update_pf_belief,
+)
+from RL_agents.rl.prior_helpers import (
+    load_pf_priors,
+    load_q_prior,
+    resolve_q_priors,
+)
 from RL_agents.rl.standardization import load_std_params, standardize_context
-from RL_agents.rl.state_helpers import (
+from RL_agents.rl.other_helpers import (
     coerce_optional_float,
     coerce_state,
     decision_seed,
     deserialize_state,
-    external_week_to_internal_k,
     feature_state,
+    internal_week_index,
     jsonable_float_array,
     jsonable_int_array,
     none_to_nan_array,
+    normalize_study_week,
     optional_state_index,
     required_config,
     serialize_state,
@@ -82,11 +90,14 @@ from RL_agents.rl.state_helpers import (
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.json")
 logger = get_logger(__name__)
 
+
+# Stored value types
 DEFAULT_B_HAT_STORED_VALUE_TYPE = "rl_b_hat"
 DEFAULT_B_TILDE_STORED_VALUE_TYPE = "rl_b_tilde"
 DEFAULT_PF_STATE_STORED_VALUE_TYPE = "rl_pf_state"
 DEFAULT_PF_STATE_HISTORY_STORED_VALUE_TYPE_PREFIX = "rl_pf_state_week"
 DEFAULT_EW_STORED_VALUE_TYPE = "rl_E_w"
+DEFAULT_Y1_OBSERVATION_TYPE = "rl_Y_1"
 
 
 def _resolve_local_path(path_value: str | Path | None) -> Path | None:
@@ -106,21 +117,11 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> dict:
         return json.load(f)
 
 
-def _gamma_dt_micro(gamma_bar: float) -> np.ndarray:
-    if float(gamma_bar) == 0.0:
-        gamma_dt = np.ones((N_RL_DAYS, N_RL_SLOTS), dtype=float)
-        gamma_dt[N_RL_DAYS - 1, N_RL_SLOTS - 1] = 0.0
-        return gamma_dt
-    return (float(gamma_bar) ** (1.0 / 12.0)) * np.ones(
-        (N_RL_DAYS, N_RL_SLOTS), dtype=float
-    )
-
-
 def _log_invalid_binary_action(
     *,
     user_id: str,
     action_type: str,
-    k: int,
+    w: int,
     d: int,
     t: int,
     action: Any,
@@ -133,7 +134,7 @@ def _log_invalid_binary_action(
         "invalid binary action",
         action_type=action_type,
         user_id=str(user_id),
-        k=k,
+        w=w,
         d=d,
         t=t,
         action=action,
@@ -141,7 +142,6 @@ def _log_invalid_binary_action(
 
 
 class RL(ActionHandlerBase):
-    """RLSVI walking-suggestion handler with the ``ActionHandlerBase`` API."""
 
     action_type = "walking_suggestion"
 
@@ -158,10 +158,36 @@ class RL(ActionHandlerBase):
             else None
         )
         self.rl_feature_names = phi_action_feature_names()
-        pf_loaded = load_pf_priors(_resolve_local_path(self.config.get("rl_prior_path")))
-        self.pf_priors, self.pf_prior_source = (
-            pf_loaded if pf_loaded is not None else ({}, None)
+        self.use_default_priors = bool(self.config.get("use_default_priors", False))
+        prior_path = _resolve_local_path(self.config.get("rl_prior_path"))
+        pf_loaded = load_pf_priors(prior_path)
+        self.pf_priors, self.pf_prior_source = resolve_pf_priors(
+            pf_loaded,
+            use_default_priors=self.use_default_priors,
         )
+        q_loaded = load_q_prior(
+            q_prior_path=_resolve_local_path(self.config.get("rl_q_prior_path")),
+            combined_prior_path=prior_path,
+            expected_feature_names=self.rl_feature_names,
+        )
+        (
+            q_mu_0,
+            q_Sigma_0,
+            q_sigma2,
+            q_feature_names,
+            self.q_prior_source,
+        ) = resolve_q_priors(
+            q_loaded,
+            config=self.config,
+            feature_names=self.rl_feature_names,
+            use_default_priors=self.use_default_priors,
+        )
+        self.q_priors = {
+            "mu_0": q_mu_0,
+            "Sigma_0": q_Sigma_0,
+            "sigma2": q_sigma2,
+            "feature_names": q_feature_names,
+        }
         self.ew_coefs = load_ew_coefs(
             _resolve_local_path(
                 self.config.get("ew_coefs_path", "Ew_pooled_linear_coefs.json")
@@ -179,42 +205,45 @@ class RL(ActionHandlerBase):
         seed = self.config.get("seed")
         return stable_seed(user_id) if seed is None else int(seed)
 
-    def _priors(
-        self, *, p_rl: int | None = None
-    ) -> tuple[np.ndarray, np.ndarray, float, list[str], str | None]:
-        mu_0_config = self.config.get("mu_0_rl")
-        if mu_0_config is None:
-            loaded = load_q_prior(
-                q_prior_path=_resolve_local_path(self.config.get("rl_q_prior_path")),
-                combined_prior_path=_resolve_local_path(self.config.get("rl_prior_path")),
-                expected_feature_names=self.rl_feature_names,
-            )
-            if loaded is not None:
-                return loaded
-            if p_rl is None:
-                p_rl = int(required_config(self.config, "p_rl"))
-            mu_0 = np.zeros(int(p_rl), dtype=float)
-            prior_source = None
-        else:
-            mu_0 = to_float_array(mu_0_config).ravel()
-            prior_source = "config"
-        Sigma_0 = to_float_array(
-            self.config.get("Sigma_0_rl"),
-            default=np.eye(mu_0.size),
+    def _y1_observation_type(self) -> str:
+        return str(
+            self.config.get("y_1_observation_type", DEFAULT_Y1_OBSERVATION_TYPE)
         )
-        sigma2 = float(self.config.get("sigma2_rl", 1.0))
-        if Sigma_0.shape != (mu_0.size, mu_0.size):
-            raise ValueError(
-                f"Sigma_0_rl shape {Sigma_0.shape} does not match mu_0_rl size {mu_0.size}"
-            )
-        if mu_0.size != len(self.rl_feature_names):
-            raise ValueError(
-                f"RL prior dimension {mu_0.size} does not match runtime feature "
-                f"dimension {len(self.rl_feature_names)}"
-            )
-        return mu_0, Sigma_0, sigma2, list(self.rl_feature_names), prior_source
 
-    def get_initial_model_params(self, user_id: str) -> dict:
+    def _y1_from_reader(self, db_reader: DBReader | None) -> float | None:
+        """Read the per-participant baseline outcome ``Y_1`` from observations.
+
+        The server records ``Y_1`` in an :class:`ObservationRecord`. It is found
+        either in any observation payload under key ``Y_1``/``Y1``, or in the
+        payload ``value`` of an observation whose ``observation_type`` matches
+        ``y_1_observation_type`` (default ``"rl_Y_1"``). Returns ``None`` when no
+        usable value is present so callers can fall back to config.
+        """
+        if db_reader is None:
+            return None
+        obs_type = self._y1_observation_type()
+        try:
+            observations = db_reader.get_observations() or []
+        except TypeError:
+            observations = db_reader.get_observations
+        for obs in observations:
+            payload = getattr(obs, "payload", {}) or {}
+            value = payload.get("Y_1", payload.get("Y1"))
+            if value is None and getattr(obs, "observation_type", None) == obs_type:
+                value = payload.get("value")
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def get_initial_model_params(
+        self,
+        user_id: str,
+        db_reader: DBReader | None = None,
+    ) -> dict:
         W = int(required_config(self.config, "W"))
         B = int(required_config(self.config, "B"))
         epsilon_0 = float(required_config(self.config, "epsilon_0"))
@@ -223,14 +252,13 @@ class RL(ActionHandlerBase):
         J = int(self.config.get("J_particles", self.config.get("J", 50)))
         gamma_dt = to_float_array(
             self.config.get("gamma_dt"),
-            default=_gamma_dt_micro(gamma_bar),
+            default=gamma_dt_matrix(gamma_bar),
         )
-        p_rl = (
-            int(self.config["p_rl"])
-            if self.config.get("p_rl") is not None
-            else None
-        )
-        mu_0, Sigma_0, sigma2, feature_names, prior_source = self._priors(p_rl=p_rl)
+        mu_0 = self.q_priors["mu_0"]
+        Sigma_0 = self.q_priors["Sigma_0"]
+        sigma2 = self.q_priors["sigma2"]
+        feature_names = self.q_priors["feature_names"]
+        prior_source = self.q_prior_source
 
         initial_seed = self._initial_seed(user_id)
         rng = np.random.default_rng(initial_seed)
@@ -245,10 +273,15 @@ class RL(ActionHandlerBase):
         b_hat_hist = np.full(W + 1, np.nan, dtype=float)
         b_tilde_hist = np.full(W + 1, np.nan, dtype=float)
         # Baseline (week 0) b_hat is hardcoded to 0 (no learned belief yet). The
-        # per-participant baseline outcome Y_1 (ParticipantInfo table) anchors the
-        # particle-filter CAE trajectory, not b_hat. Y_1 falls back to config here
-        # because get_initial_model_params has no db_reader (see notes to API).
-        Y_1 = float(self.config.get("Y_1", 0.0))
+        # per-participant baseline outcome Y_1 anchors the particle-filter CAE
+        # trajectory, not b_hat. Y_1 is read from the ObservationRecord via
+        # db_reader when available, falling back to config otherwise.
+        y1_observed = self._y1_from_reader(db_reader)
+        Y_1 = (
+            float(y1_observed)
+            if y1_observed is not None
+            else float(self.config.get("Y_1", 0.0))
+        )
         b_hat_hist[0] = 0.0
         b_tilde_hist[0] = 0.0
         pf_state = initial_pf_state(J=J, Y_1=Y_1)
@@ -307,10 +340,9 @@ class RL(ActionHandlerBase):
         db_reader: DBReader,
     ) -> StateResult:
         try:
-            # Convert the 1-indexed external study week (w, as in Query.py) to the
-            # internal 0-indexed RL week k = w - 1 at the boundary; internals stay
-            # 0-indexed.
-            context_for_state = external_week_to_internal_k(context)
+            # Normalize to 1-indexed study week w (same convention as Query).
+            # Array indexing inside this handler uses k = w - 1.
+            context_for_state = normalize_study_week(context)
             # Perceived utility E_w: if the request context omits it, fall back to
             # the value written weekly by prepare_for_update's E_w update.
             if (
@@ -348,10 +380,10 @@ class RL(ActionHandlerBase):
                     ),
                 )
             if b_hat is None or b_tilde is None:
-                k_idx, _, _ = optional_state_index(state)
-                if k_idx == 0:
+                w_idx, _, _ = optional_state_index(state)
+                if w_idx == 1:
                     # Baseline (enrollment) week: no learned belief exists yet, so
-                    # b_hat is hardcoded to 0 (get_action randomizes at k=0 anyway).
+                    # b_hat is hardcoded to 0 (get_action randomizes at w=1 anyway).
                     # The per-participant baseline outcome Y_1 lives in the
                     # ParticipantInfo table and anchors the particle filter, not b_hat.
                     b_hat = 0.0 if b_hat is None else b_hat
@@ -584,12 +616,15 @@ class RL(ActionHandlerBase):
             return [int(packet["action_id"])]
         if db_reader is None or packet.get("k") is None:
             return []
+        # PF packet k is the 0-indexed belief-week array index; rewards attach to
+        # actions from the completed study week (internal index packet["k"] - 1).
         reward_k = int(packet["k"]) - 1
         out = []
         for action in db_reader.get_actions(action_type=self.action_type):
             try:
                 state = deserialize_state(action.state or action.context or {})
-                k, _, _ = state_index(state)
+                w, _, _ = state_index(state)
+                k = internal_week_index(w)
             except (KeyError, TypeError, ValueError):
                 continue
             if k == reward_k:
@@ -597,14 +632,15 @@ class RL(ActionHandlerBase):
         return out
 
     def _infer_pf_packet_k(self, db_reader: DBReader) -> int | None:
+        """Infer 0-indexed PF belief-week index from action states."""
         if db_reader is None:
             return None
         ks = []
         for action in db_reader.get_actions(action_type=self.action_type):
             try:
                 state = deserialize_state(action.state or action.context or {})
-                k, _, _ = state_index(state)
-                ks.append(k)
+                w, _, _ = state_index(state)
+                ks.append(internal_week_index(w))
             except (KeyError, TypeError, ValueError):
                 continue
         return max(ks) + 1 if ks else None
@@ -675,11 +711,11 @@ class RL(ActionHandlerBase):
         try:
             return self._get_action_impl(user_id, state, model_params)
         except Exception as exc:
-            k, d, t = optional_state_index(state)
+            w, d, t = optional_state_index(state)
             fallback_seed = decision_seed(
                 self.config.get("seed"),
                 user_id,
-                k,
+                w,
                 d,
                 t,
                 fallback=True,
@@ -690,7 +726,7 @@ class RL(ActionHandlerBase):
                 "real-time action selection failed; using fallback randomization",
                 action_type=self.action_type,
                 user_id=str(user_id),
-                k=k,
+                w=w,
                 d=d,
                 t=t,
                 error_type=type(exc).__name__,
@@ -711,22 +747,23 @@ class RL(ActionHandlerBase):
         model_params: dict,
     ) -> ActionResult:
         state = deserialize_state(state)
-        k, d, t = state_index(state)
+        w, d, t = state_index(state)
+        k = internal_week_index(w)
         validate_feature_dimension(
             user_id=user_id,
             action_type=self.action_type,
             state=state,
             model_params=model_params,
         )
-        if k == 0:
-            action_seed = decision_seed(self.config.get("seed"), user_id, k, d, t)
+        if w == 1:
+            action_seed = decision_seed(self.config.get("seed"), user_id, w, d, t)
             rng = np.random.default_rng(action_seed)
             action = int(rng.binomial(1, 0.5))
             action_prob = 0.5
             _log_invalid_binary_action(
                 user_id=user_id,
                 action_type=self.action_type,
-                k=k,
+                w=w,
                 d=d,
                 t=t,
                 action=action,
@@ -753,13 +790,13 @@ class RL(ActionHandlerBase):
         phi_0 = build_phi_action(b_hat, b_tilde, feature_state(state), d, t, 0)
         pi_hat = ensemble_action_prob(phi_1, phi_0, betas)
         pi_A = clip_prob(pi_hat, float(model_params["epsilon_0"]))
-        action_seed = decision_seed(self.config.get("seed"), user_id, k, d, t)
+        action_seed = decision_seed(self.config.get("seed"), user_id, w, d, t)
         rng = np.random.default_rng(action_seed)
         action = int(rng.binomial(1, pi_A))
         _log_invalid_binary_action(
             user_id=user_id,
             action_type=self.action_type,
-            k=k,
+            w=w,
             d=d,
             t=t,
             action=action,
@@ -807,6 +844,9 @@ class RL(ActionHandlerBase):
                         packet=packet,
                         pf_priors=self.pf_priors,
                         rng=rng,
+                        refit_sigma2=bool(
+                            self.config.get("pf_refit_sigma2", True)
+                        ),
                     )
                     if pf_update.get("sigma2_eb_error"):
                         log_alert(
@@ -901,7 +941,8 @@ class RL(ActionHandlerBase):
         max_k_seen = -1
         for record in actions:
             state = deserialize_state(record.state or record.context or {})
-            k, d, t = state_index(state)
+            w, d, t = state_index(state)
+            k = internal_week_index(w)
             validate_feature_dimension(
                 user_id=user_id,
                 action_type=self.action_type,
@@ -915,7 +956,7 @@ class RL(ActionHandlerBase):
                     "action day/slot index out of range",
                     action_type=self.action_type,
                     user_id=str(user_id),
-                    k=k,
+                    w=w,
                     d=d,
                     t=t,
                     n_rl_days=self.n_rl_days,

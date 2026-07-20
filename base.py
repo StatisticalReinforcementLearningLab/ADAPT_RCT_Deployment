@@ -116,7 +116,11 @@ class ActionHandlerBase(ABC):
         pass
 
     @abstractmethod
-    def get_initial_model_params(self, user_id: str) -> dict:
+    def get_initial_model_params(
+        self,
+        user_id: str,
+        db_reader: "DBReader | None" = None,
+    ) -> dict:
         pass
 
     @abstractmethod

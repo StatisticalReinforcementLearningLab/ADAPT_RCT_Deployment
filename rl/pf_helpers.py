@@ -7,9 +7,63 @@ from typing import Any
 import numpy as np
 
 from RL_agents.rl.algorithm_helpers import empirical_bayes_sigma2, spd_inverse
-from RL_agents.rl.state_helpers import jsonable_float_array, none_to_nan_array
+from RL_agents.rl.other_helpers import jsonable_float_array, none_to_nan_array
 
 FOURSC_SLOTS_PER_WEEK = 14
+
+# PF regression model dimensions (fourSC, antic, weekly CAE, short CAE).
+PF_FOURSC_DIM = 25
+PF_ANTIC_DIM = 19
+PF_CAE_DIM = 24
+PF_CAE_SHORT_DIM = 2
+
+
+def default_pf_priors(
+    *,
+    sigma2_MY: list[float] | None = None,
+    sigma2_Y: float = 1.0,
+    sigma2_tilde_Y: float = 1.0,
+) -> dict:
+    """Uninformative PF priors with canonical model dimensions.
+
+    Mediator models: fourSC (``PF_FOURSC_DIM``) and antic (``PF_ANTIC_DIM``).
+    Outcome models: weekly CAE (``PF_CAE_DIM``) and short CAE (``PF_CAE_SHORT_DIM``).
+    """
+    if sigma2_MY is None:
+        sigma2_MY = [1.0, 1.0]
+    return {
+        "nu_0_MY": [
+            np.zeros(PF_FOURSC_DIM, dtype=float),
+            np.zeros(PF_ANTIC_DIM, dtype=float),
+        ],
+        "Gamma_0_MY": [
+            np.eye(PF_FOURSC_DIM, dtype=float),
+            np.eye(PF_ANTIC_DIM, dtype=float),
+        ],
+        "sigma2_MY": [float(s) for s in sigma2_MY],
+        "nu_0_Y": np.zeros(PF_CAE_DIM, dtype=float),
+        "Gamma_0_Y": np.eye(PF_CAE_DIM, dtype=float),
+        "sigma2_Y": float(sigma2_Y),
+        "nu_0_tilde_Y": np.zeros(PF_CAE_SHORT_DIM, dtype=float),
+        "Gamma_0_tilde_Y": np.eye(PF_CAE_SHORT_DIM, dtype=float),
+        "sigma2_tilde_Y": float(sigma2_tilde_Y),
+    }
+
+
+def resolve_pf_priors(
+    loaded: tuple[dict, str] | None,
+    *,
+    use_default_priors: bool = False,
+) -> tuple[dict, str | None]:
+    """Return PF priors for the handler.
+
+    Uses fitted priors from ``load_pf_priors`` when available and
+    ``use_default_priors`` is false; otherwise returns ``default_pf_priors()``.
+    """
+    if use_default_priors or loaded is None:
+        return default_pf_priors(), "default"
+    pf_priors, source = loaded
+    return pf_priors, source
 
 
 def normalize_pf_packet(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -279,8 +333,15 @@ def update_pf_belief(
     packet: dict[str, Any],
     pf_priors: dict[str, Any],
     rng: np.random.Generator,
+    refit_sigma2: bool = True,
 ) -> tuple[dict[str, Any], float, float]:
-    """Run one weekly particle-filter update from a normalized PF packet."""
+    """Run one weekly particle-filter update from a normalized PF packet.
+
+    When ``refit_sigma2`` is ``False`` the online empirical-Bayes refit of the
+    mediator/CAE noise variances is skipped, and the ``sigma2_*`` values carried
+    in ``model_params`` (i.e. the PF prior variances) are used as-is for this
+    week's posterior draws and likelihoods.
+    """
     pf_data = packet["pf_data"]
     k = int(packet["k"])
     if k == 0:
@@ -305,7 +366,7 @@ def update_pf_belief(
     # fatal): the prior sigma^2 are retained and a marker is returned for a
     # yellow "online noise-variance update failed" alert upstream.
     sigma2_eb_error = None
-    if has_cumul:
+    if has_cumul and refit_sigma2:
         try:
             ybar = (
                 np.asarray(v_hat, dtype=float).ravel() @ np.asarray(y_hat, dtype=float)

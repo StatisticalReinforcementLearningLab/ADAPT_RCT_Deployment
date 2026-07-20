@@ -27,7 +27,7 @@ RL_agents/
     |-- pf_helpers.py        # Particle-filter belief updates
     |-- ew_helpers.py        # Perceived-utility (E_w) pooled-linear update
     |-- prior_helpers.py     # Prior loading helpers
-    |-- state_helpers.py     # State coercion, validation, serialization
+    |-- other_helpers.py     # State coercion, validation, serialization
     |-- standardization.py   # Optional context standardization
     |-- config.json          # RL policy settings
     |-- rl_priors.json       # Particle-filter prior parameters
@@ -152,8 +152,8 @@ The participant object should include one of these enrollment/start date keys:
 - `StudyStartDate`
 - `date_min`
 
-If no decision timestamp is provided, the context must already include a week
-field: `w`, `k`, `rl_week`, or `week`.
+If no decision timestamp is provided, the context must already include a
+1-indexed study week field: `w`, `rl_week`, or `week`.
 
 ### Query Action Output
 
@@ -181,9 +181,9 @@ actions:
 - `action = 1`: send a walking suggestion
 - `action = 0`: do not send a walking suggestion
 
-At internal week `k = 0`, the handler randomizes with probability `0.5`.
-After that, it computes the ensemble probability that action `1` has greater
-value than action `0`, then clips that probability to
+At study week `w = 1` (enrollment/baseline), the handler randomizes with
+probability `0.5`. After that, it computes the ensemble probability that
+action `1` has greater value than action `0`, then clips that probability to
 `[epsilon_0, 1 - epsilon_0]`.
 
 Default policy settings live in `rl/config.json`:
@@ -206,14 +206,17 @@ state for one decision point.
 
 Week indexing:
 
-- external framework/query weeks are 1-indexed: `w = 1` means baseline week
-- RL internals are 0-indexed: `k = 0` means baseline week
-- if context includes `w`, `rl_week`, or `week`, it is converted to `k = w - 1`
-- if context includes only `k`, it is assumed to already be 0-indexed
+- Query and RL both use 1-indexed study week `w` at the API/state boundary
+  (`w = 1` is enrollment/baseline)
+- accepted incoming aliases: `w`, `rl_week`, `week` (all 1-indexed)
+- legacy serialized states that only have 0-indexed `k` are converted via
+  `w = k + 1` on deserialize
+- RL array math still uses local `k = w - 1` (e.g. `A_hist[k, d, t]`);
+  PF packets retain that internal `k`
 
 Required decision index fields:
 
-- `k` or external `w`/`rl_week`/`week`
+- `w` (or alias `rl_week` / `week`)
 - `d` or `day`: 0-indexed day within the RL week
 - `t` or `slot`: 0-indexed decision slot within the day
 
@@ -246,7 +249,7 @@ the framework stored values named in `rl/config.json`:
 - `rl_b_hat`
 - `rl_b_tilde`
 
-At baseline week `k = 0`, missing beliefs default to `0.0`.
+At baseline week `w = 1`, missing beliefs default to `0.0`.
 
 If `E_w`/`perceivedUtility` is missing from the context, `make_state(...)` reads
 the perceived utility from the stored value `rl_E_w`, which the weekly E_w update
@@ -256,7 +259,7 @@ in `prepare_for_update(...)` maintains.
 
 ```python
 context = {
-    "w": 2,              # external 1-indexed week; converted to internal k = 1
+    "w": 2,              # 1-indexed study week (same as Query); arrays use k = w - 1
     "d": 0,
     "t": 0,
     "E_w": 0.3,
@@ -341,7 +344,7 @@ Deliver one packet per completed RL week as an observation with type
 
 | Packet field | Type | Meaning |
 |--------------|------|---------|
-| `w` or `k` | int | Study week: 1-indexed `w` (converted to `k = w - 1`) or internal 0-indexed `k` |
+| `w` or `k` | int | Prefer 1-indexed study week `w` (converted to internal `k = w - 1`); raw `k` is the 0-indexed PF/array week |
 | `I_w` | 0/1 | Query arm this week (1 = full CAE observed, 0 = short CAE observed) |
 | `J_w` | 0/1 or null | Week-present gate; if `!= 1`, no CAE outcome is used this week |
 | `Y_prev` / `Y_w` | float or null | Full weekly CAE from the finalized week (used when `I_w = 1`) |

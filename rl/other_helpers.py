@@ -35,14 +35,14 @@ def stable_seed(value: str) -> int:
 def decision_seed(
     base_seed: Any,
     user_id: str,
-    k: int | None,
+    w: int | None,
     d: int | None,
     t: int | None,
     *,
     fallback: bool = False,
 ) -> int:
     seed_material = json.dumps(
-        [base_seed, str(user_id), k, d, t, "fallback" if fallback else "action"],
+        [base_seed, str(user_id), w, d, t, "fallback" if fallback else "action"],
         separators=(",", ":"),
     )
     return stable_seed(seed_material)
@@ -126,35 +126,51 @@ def coerce_mediator_matrix(
     return out
 
 
-def external_week_to_internal_k(context: dict) -> dict:
-    """Map the 1-indexed external study week to the internal 0-indexed RL week.
+def normalize_study_week(context: dict) -> dict:
+    """Normalize context/state to a single 1-indexed study week field ``w``.
 
-    The framework/API and ``Query.py`` speak 1-indexed weeks (``w=1`` is the
-    enrollment/baseline week). ``RL.py`` internals are 0-indexed (``k=0`` is the
-    baseline), with ``k = w - 1``. This boundary helper converts a raw context:
-    if a 1-indexed week alias (``w``/``rl_week``/``week``) is present it is turned
-    into ``k`` and the aliases are dropped so ``state_index`` reads the converted
-    ``k`` unambiguously. If only ``k`` is present it is assumed to already be the
-    internal 0-indexed value and is left untouched.
+    Query and RL both speak 1-indexed study weeks at the API/state boundary
+    (``w=1`` is enrollment/baseline). Accepted incoming aliases:
+
+    - ``w``, ``rl_week``, ``week``: 1-indexed study week
+    - legacy ``k`` only (no ``w``/aliases): treated as the old RL 0-indexed
+      week and converted via ``w = k + 1``
+
+    Aliases are dropped so ``state_index`` reads ``w`` unambiguously. Array
+    indexing inside RL still uses ``k = w - 1`` via ``internal_week_index``.
     """
     ctx = dict(context or {})
     for key in ("w", "rl_week", "week"):
         if ctx.get(key) is not None:
-            k = int(ctx[key]) - 1
-            for alias in ("w", "rl_week", "week"):
+            w = int(ctx[key])
+            for alias in ("w", "rl_week", "week", "k"):
                 ctx.pop(alias, None)
-            ctx["k"] = k
+            if w < 1:
+                raise ValueError(f"study week w must be >= 1, got {w}")
+            ctx["w"] = w
             return ctx
+    if ctx.get("k") is not None:
+        k = int(ctx["k"])
+        ctx.pop("k", None)
+        ctx["w"] = k + 1
+        return ctx
     return ctx
 
 
+def internal_week_index(w: int) -> int:
+    """Map 1-indexed study week ``w`` to 0-indexed RL array index ``k``."""
+    return int(w) - 1
+
+
 def state_index(state: dict) -> tuple[int, int, int]:
-    k = state.get("k", state.get("week"))
+    """Return ``(w, d, t)`` with 1-indexed study week ``w``."""
+    state = normalize_study_week(state)
+    w = state.get("w")
     d = state.get("d", state.get("day"))
     t = state.get("t", state.get("slot"))
-    if k is None or d is None or t is None:
-        raise KeyError("state must include k/week, d/day, and t/slot")
-    return int(k), int(d), int(t)
+    if w is None or d is None or t is None:
+        raise KeyError("state must include w (or legacy k), d/day, and t/slot")
+    return int(w), int(d), int(t)
 
 
 def optional_state_index(state: dict | None) -> tuple[int | None, int | None, int | None]:
@@ -170,8 +186,8 @@ def coerce_state(raw: dict) -> dict:
     """Coerce a framework context/state dict for ``build_phi_action``."""
     if raw is None:
         raw = {}
-    state = dict(raw)
-    k, d, t = state_index(state)
+    state = normalize_study_week(raw)
+    w, d, t = state_index(state)
 
     if "C" in state:
         C = np.asarray(state["C"], dtype=float).ravel()
@@ -200,7 +216,7 @@ def coerce_state(raw: dict) -> dict:
 
     return {
         **state,
-        "k": k,
+        "w": w,
         "d": d,
         "t": t,
         "E_w": float(
@@ -241,20 +257,22 @@ def stored_float(db_reader: DBReader, stored_value_type: str) -> float | None:
 
 def infer_p_rl(state: dict) -> int:
     """Infer RLSVI feature dimension from the state produced by ``make_state``."""
-    k, d, t = state_index(state)
+    _, d, t = state_index(state)
     phi = build_phi_action(0.0, 0.0, feature_state(state), d, t, 0)
     return int(phi.size)
 
 
 def state_key(k: int, d: int, t: int) -> str:
+    """History key using 0-indexed internal week ``k`` (array index)."""
     return f"{int(k)}:{int(d)}:{int(t)}"
 
 
 def serialize_state(state: dict) -> dict:
+    w, d, t = state_index(state)
     return {
-        "k": int(state["k"]),
-        "d": int(state["d"]),
-        "t": int(state["t"]),
+        "w": int(w),
+        "d": int(d),
+        "t": int(t),
         "E_w": float(state["E_w"]),
         "M_Y": jsonable_float_array(np.asarray(state["M_Y"], dtype=float)),
         "M_E": jsonable_float_array(np.asarray(state["M_E"], dtype=float)),
@@ -293,14 +311,14 @@ def validate_feature_dimension(
     )
     if p_state == p_model:
         return
-    k, d, t = state_index(state)
+    w, d, t = state_index(state)
     log_alert(
         logger,
         RED,
         "RL state feature dimension does not match model parameters",
         action_type=action_type,
         user_id=str(user_id),
-        k=k,
+        w=w,
         d=d,
         t=t,
         p_state=p_state,

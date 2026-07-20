@@ -19,8 +19,9 @@ seed, participant ID, and study week.
 
 ``make_state`` derives the 1-indexed study week ``w`` from the request context
 (decision datetime + timezone) and participant enrollment metadata from
-``db_reader.get_retrieved_data()``. RL_agents state fields ``w``, ``k``,
-``rl_week``, and ``week`` are all treated as 1-indexed.
+``db_reader.get_retrieved_data()``. Query and RL both use ``w`` as the public
+study-week field. Incoming aliases ``rl_week`` and ``week`` are also accepted
+as 1-indexed study weeks.
 """
 
 from __future__ import annotations
@@ -82,7 +83,8 @@ def _week_from_state(state: dict) -> int:
 
 
 def _optional_week_from_state(state: dict) -> int | None:
-    for key in ("w", "k", "rl_week", "week"):
+    """Return 1-indexed study week from ``w`` or accepted aliases."""
+    for key in ("w", "rl_week", "week"):
         if key in state and state[key] is not None:
             return int(state[key])
     return None
@@ -186,7 +188,11 @@ class Query(ActionHandlerBase):
     def __init__(self, config: dict | None = None):
         self.config = load_config() if config is None else config
 
-    def get_initial_model_params(self, user_id: str) -> dict:
+    def get_initial_model_params(
+        self,
+        user_id: str,
+        db_reader: DBReader | None = None,
+    ) -> dict:
         return {
             "version": 2,
             "user_id": str(user_id),

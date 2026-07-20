@@ -13,11 +13,13 @@
   "pf_state_history_stored_value_type_prefix": "rl_pf_state_week",
   "ew_coefs_path": "Ew_pooled_linear_coefs.json",
   "ew_stored_value_type": "rl_E_w",
+  "y_1_observation_type": "rl_Y_1",
   "standardize_context": true,
   "std_params_path": "std_params.json",
   "rl_prior_path": "rl_priors.json",
-  "rl_q_prior_path": "rl_q_priors.json",
+  "use_default_priors": false,
   "J_particles": 50,
+  "pf_refit_sigma2": true,
   "sigma2_rl": 1.0,
   "seed": null
 }

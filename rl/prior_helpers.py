@@ -39,10 +39,13 @@ def load_q_prior(
     combined_prior_path: str | Path | None,
     expected_feature_names: list[str],
 ) -> tuple[np.ndarray, np.ndarray, float, list[str], str] | None:
-    """Load Q prior coefficients only if feature order is auditable.
+    """Load the base Q prior (``q_no_td_modify``) only if feature order is auditable.
 
-    ``rl_q_priors.json`` is preferred because it stores ``feature_names``.
-    Legacy files may have 79 coefficients but 77 runtime feature names because
+    The single prior source is ``rl_priors.json`` (its ``q_no_td_modify`` block),
+    read via ``combined_prior_path``. ``q_prior_path`` remains as an optional
+    override for a standalone Q-prior file but is unset by default.
+
+    Legacy blocks may have 79 coefficients but 77 runtime feature names because
     two hardcoded-zero placeholder columns were removed from ``RL_agents``.
     In that case we strip exactly those two columns before validating names.
     """
@@ -80,6 +83,68 @@ def load_q_prior(
         names = list(expected_feature_names)
 
     return mu_0, Sigma_0, sigma2, names, str(source_path)
+
+
+def default_q_priors(
+    feature_names: list[str],
+    *,
+    sigma2: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray, float, list[str], str]:
+    """Uninformative RLSVI Q prior: zero mean and identity covariance."""
+    p = len(feature_names)
+    mu_0 = np.zeros(p, dtype=float)
+    Sigma_0 = np.eye(p, dtype=float)
+    return mu_0, Sigma_0, float(sigma2), list(feature_names), "default"
+
+
+def resolve_q_priors(
+    loaded: tuple[np.ndarray, np.ndarray, float, list[str], str] | None,
+    *,
+    config: dict,
+    feature_names: list[str],
+    use_default_priors: bool = False,
+) -> tuple[np.ndarray, np.ndarray, float, list[str], str | None]:
+    """Return RLSVI Q priors for the handler.
+
+    Priority:
+    1. ``use_default_priors`` → ``default_q_priors``
+    2. ``config["mu_0_rl"]`` override
+    3. fitted prior from ``load_q_prior``
+    4. zero mean with ``config["p_rl"]`` (or runtime feature dimension)
+    """
+    sigma2 = float(config.get("sigma2_rl", 1.0))
+    if use_default_priors:
+        return default_q_priors(feature_names, sigma2=sigma2)
+
+    mu_0_config = config.get("mu_0_rl")
+    if mu_0_config is None:
+        if loaded is not None:
+            return loaded
+        p_rl = config.get("p_rl")
+        if p_rl is None:
+            p_rl = len(feature_names)
+        mu_0 = np.zeros(int(p_rl), dtype=float)
+        prior_source = None
+    else:
+        mu_0 = np.asarray(mu_0_config, dtype=float).ravel()
+        prior_source = "config"
+
+    sigma_config = config.get("Sigma_0_rl")
+    Sigma_0 = (
+        np.eye(mu_0.size, dtype=float)
+        if sigma_config is None
+        else np.asarray(sigma_config, dtype=float)
+    )
+    if Sigma_0.shape != (mu_0.size, mu_0.size):
+        raise ValueError(
+            f"Sigma_0_rl shape {Sigma_0.shape} does not match mu_0_rl size {mu_0.size}"
+        )
+    if mu_0.size != len(feature_names):
+        raise ValueError(
+            f"RL prior dimension {mu_0.size} does not match runtime feature "
+            f"dimension {len(feature_names)}"
+        )
+    return mu_0, Sigma_0, sigma2, list(feature_names), prior_source
 
 
 def load_pf_priors(combined_prior_path: str | Path | None) -> tuple[dict, str] | None:

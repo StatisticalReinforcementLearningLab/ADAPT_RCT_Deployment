@@ -7,11 +7,32 @@ by the deployment-facing RL handler. Keeping these helpers inside
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import numpy as np
 from scipy.optimize import minimize_scalar
 
-N_RL_DAYS = 6
-N_RL_SLOTS = 2
+_DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.json")
+
+
+def _rl_dimensions_from_config(
+    config_path: Path = _DEFAULT_CONFIG_PATH,
+) -> tuple[int, int]:
+    path = config_path.expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"RL config not found at {path}; n_rl_days and n_rl_slots are required"
+        )
+    with path.open(encoding="utf-8") as f:
+        config = json.load(f)
+    for key in ("n_rl_days", "n_rl_slots"):
+        if key not in config or config[key] is None:
+            raise KeyError(f"RL config must include {key!r}")
+    return int(config["n_rl_days"]), int(config["n_rl_slots"])
+
+
+N_RL_DAYS, N_RL_SLOTS = _rl_dimensions_from_config()
 FIRST_D = 0
 FIRST_T = 0
 TERMINAL_D = N_RL_DAYS - 1
@@ -19,6 +40,22 @@ TERMINAL_T = N_RL_SLOTS - 1
 
 EB_SIGMA2_MIN = 1e-4
 EB_SIGMA2_LOG_HALFWIDTH = 8.0
+
+
+def gamma_dt_matrix(gamma_bar: float) -> np.ndarray:
+    """Per-slot discount matrix ``gamma_{d,t}`` (mirrors ``experiment._gamma_dt_micro``).
+
+    For ``gamma_bar = 0`` (myopic): non-terminal slots use ``gamma = 1``; the
+    terminal slot uses ``gamma = 0``. Otherwise every slot uses
+    ``gamma_bar ** (1 / (n_rl_days * n_rl_slots))``.
+    """
+    if float(gamma_bar) == 0.0:
+        gamma_dt = np.ones((N_RL_DAYS, N_RL_SLOTS), dtype=float)
+        gamma_dt[TERMINAL_D, TERMINAL_T] = 0.0
+        return gamma_dt
+    return (float(gamma_bar) ** (1.0 / (N_RL_DAYS * N_RL_SLOTS))) * np.ones(
+        (N_RL_DAYS, N_RL_SLOTS), dtype=float
+    )
 
 
 def spd_inverse(A):
