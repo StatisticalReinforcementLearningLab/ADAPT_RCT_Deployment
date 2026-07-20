@@ -30,8 +30,14 @@ from typing import Any
 
 import numpy as np
 
+from RL_agents.base import StoredValue
+from RL_agents.logging_config import YELLOW, get_logger, log_alert
+
+logger = get_logger(__name__)
+
 EW_PREDICTORS = ("J_w", "half_J_tool8", "PV_sum", "FW_sum", "PJ_sum")
 DEFAULT_EW_HAT = 2.0
+DEFAULT_EW_STORED_VALUE_TYPE = "rl_E_w"
 
 
 def load_ew_coefs(path: str | Path | None) -> dict[str, float] | None:
@@ -109,3 +115,66 @@ def compute_ew_hat(coefs: dict[str, float], inputs: dict) -> float:
     return apply_pooled_coefs(
         coefs, p["J_w"], p["half_J_tool8"], p["PV_sum"], p["FW_sum"], p["PJ_sum"]
     )
+
+
+def ew_stored_value_type(config: dict) -> str:
+    return str(config.get("ew_stored_value_type", DEFAULT_EW_STORED_VALUE_TYPE))
+
+
+def ew_inputs(observations: list, packet: dict | None) -> dict | None:
+    """Locate weekly E_w predictor aggregates for the perceived-utility update.
+
+    The server assembles these from the database for the just-finalized week.
+    Accepted locations: ``packet["ew_inputs"]``, an observation payload with an
+    ``ew_inputs`` dict, or an observation of type ``rl_ew_inputs``.
+    """
+    if packet is not None and isinstance(packet.get("ew_inputs"), dict):
+        return packet["ew_inputs"]
+    for obs in observations:
+        payload = getattr(obs, "payload", {}) or {}
+        if isinstance(payload.get("ew_inputs"), dict):
+            return payload["ew_inputs"]
+        if getattr(obs, "observation_type", None) == "rl_ew_inputs" and payload:
+            return payload
+    return None
+
+
+def prepare_ew_update(
+    config: dict,
+    user_id: str,
+    observations: list,
+    packet: dict | None,
+    *,
+    ew_coefs: dict[str, float] | None,
+    action_type: str,
+) -> list[StoredValue] | None:
+    """Weekly perceived-utility (E_w) update from pooled linear coefficients.
+
+    Returns a stored value for the updated E_w (consumed by ``make_state`` for
+    the next week's decisions), or ``None`` if coefficients or inputs are
+    unavailable. Failures emit a yellow alert and return ``None``.
+    """
+    if ew_coefs is None:
+        return None
+    inputs = ew_inputs(observations, packet)
+    if inputs is None:
+        return None
+    try:
+        ew_hat = compute_ew_hat(ew_coefs, inputs)
+    except Exception as exc:
+        log_alert(
+            logger,
+            YELLOW,
+            "perceived-utility (E_w) update failed",
+            action_type=action_type,
+            user_id=str(user_id),
+            error=str(exc),
+        )
+        return None
+    return [
+        StoredValue(
+            user_id=str(user_id),
+            type=ew_stored_value_type(config),
+            value=float(ew_hat),
+        )
+    ]

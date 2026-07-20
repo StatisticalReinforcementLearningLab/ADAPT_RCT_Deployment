@@ -19,7 +19,7 @@
   "rl_prior_path": "rl_priors.json",
   "use_default_priors": false,
   "J_particles": 50,
-  "pf_refit_sigma2": true,
+  "pf_refit_sigma2": false,
   "sigma2_rl": 1.0,
   "seed": null
 }

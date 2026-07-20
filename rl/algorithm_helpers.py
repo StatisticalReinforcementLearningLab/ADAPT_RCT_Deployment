@@ -102,6 +102,20 @@ def clip_prob(pi_hat, epsilon_0):
     return np.clip(pi_hat, epsilon_0, 1.0 - epsilon_0)
 
 
+def betas_for_action(model_params: dict, k: int, d: int) -> list[np.ndarray]:
+    """Select the ``betas_store`` ensemble for week ``k`` and day ``d``."""
+    stores = model_params.get("betas_store", {})
+    if k <= 0:
+        key = "0"
+    elif d >= 1 and str(k) in stores:
+        key = str(k)
+    else:
+        key = str(max(k - 1, 0))
+    if key not in stores:
+        key = "0"
+    return [np.asarray(beta, dtype=float) for beta in stores[key]]
+
+
 def _eb_neg_marginal_loglik(log_s2, XtX, Xty, yty, n, Sigma0_inv, Sigma0_inv_mu0):
     rho = float(np.exp(-log_s2))
     A = Sigma0_inv + rho * XtX

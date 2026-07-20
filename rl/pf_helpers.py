@@ -6,8 +6,20 @@ from typing import Any
 
 import numpy as np
 
+from RL_agents.base import DBReader, StoredValue
+from RL_agents.logging_config import YELLOW, get_logger, log_alert
 from RL_agents.rl.algorithm_helpers import empirical_bayes_sigma2, spd_inverse
-from RL_agents.rl.other_helpers import jsonable_float_array, none_to_nan_array
+from RL_agents.rl.other_helpers import (
+    belief_stored_values,
+    deserialize_state,
+    internal_week_index,
+    jsonable_float_array,
+    none_to_nan_array,
+    state_index,
+    stored_belief,
+)
+
+logger = get_logger(__name__)
 
 FOURSC_SLOTS_PER_WEEK = 14
 
@@ -114,6 +126,102 @@ def latest_pf_packet(observations: list[Any]) -> dict[str, Any] | None:
     if not packets:
         return None
     return packets[-1]
+
+
+def _action_week_k_pairs(
+    db_reader: DBReader | None, action_type: str
+) -> list[tuple[int, int]]:
+    """Return ``(action_id, internal week k)`` for actions with parseable RL state."""
+    if db_reader is None:
+        return []
+    out: list[tuple[int, int]] = []
+    for action in db_reader.get_actions(action_type=action_type):
+        try:
+            state = deserialize_state(action.state or action.context or {})
+            w, _, _ = state_index(state)
+            out.append((int(action.action_id), internal_week_index(w)))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def action_ids_for_pf_reward(
+    db_reader: DBReader | None,
+    packet: dict,
+    *,
+    action_type: str,
+) -> list[int]:
+    if packet.get("action_ids") is not None:
+        return [int(action_id) for action_id in packet["action_ids"]]
+    if packet.get("action_id") is not None:
+        return [int(packet["action_id"])]
+    if db_reader is None or packet.get("k") is None:
+        return []
+    # PF packet k is the 0-indexed belief-week array index; rewards attach to
+    # actions from the completed study week (internal index packet["k"] - 1).
+    reward_k = int(packet["k"]) - 1
+    return [
+        action_id
+        for action_id, k in _action_week_k_pairs(db_reader, action_type)
+        if k == reward_k
+    ]
+
+
+def infer_pf_packet_k(
+    db_reader: DBReader | None,
+    *,
+    action_type: str,
+) -> int | None:
+    """Infer 0-indexed PF belief-week index from action states."""
+    ks = [k for _, k in _action_week_k_pairs(db_reader, action_type)]
+    return max(ks) + 1 if ks else None
+
+
+def prepare_belief_fallback(
+    config: dict,
+    *,
+    action_type: str,
+    user_id: str,
+    db_reader: DBReader,
+    packet: dict | None,
+    rewards: dict[int, float],
+    reason: str,
+    error: str | None = None,
+) -> tuple[list[StoredValue] | None, list[dict] | None]:
+    log_alert(
+        logger,
+        YELLOW,
+        "PF prepare failed; using latest stored belief",
+        action_type=action_type,
+        user_id=str(user_id),
+        reason=reason,
+        error=error,
+    )
+    b_hat, b_tilde = stored_belief(config, db_reader)
+    if b_hat is None or b_tilde is None:
+        return None, [packet] if packet is not None else None
+
+    action_ids = action_ids_for_pf_reward(
+        db_reader, packet or {}, action_type=action_type
+    )
+    for action_id in action_ids:
+        rewards[int(action_id)] = float(b_hat)
+
+    transformed = None
+    if packet is not None:
+        transformed = [
+            {
+                **packet,
+                "pf_result": {
+                    "fallback": True,
+                    "reason": reason,
+                    "b_hat": float(b_hat),
+                    "b_tilde": float(b_tilde),
+                    "reward_action_ids": action_ids,
+                },
+            }
+        ]
+    return belief_stored_values(config, user_id, b_hat, b_tilde), transformed
 
 
 def initial_pf_state(*, J: int, Y_1: float) -> dict[str, Any]:

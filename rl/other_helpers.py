@@ -91,6 +91,35 @@ def jsonable_int_array(arr: np.ndarray) -> list:
     return np.asarray(arr, dtype=int).tolist()
 
 
+def history_arrays(
+    model_params: dict,
+    *,
+    n_rl_days: int | None = None,
+    n_rl_slots: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Load persisted RL history arrays from ``model_params`` as NumPy arrays."""
+    W = int(model_params["W"])
+    n_days = int(model_params.get("n_rl_days", n_rl_days))
+    n_slots = int(model_params.get("n_rl_slots", n_rl_slots))
+    A_hist = to_int_array(
+        model_params.get("A_hist"),
+        default=np.zeros((W, n_days, n_slots), dtype=int),
+    )
+    pi_A_hist = none_to_nan_array(
+        model_params.get("pi_A_hist"),
+        shape=(W, n_days, n_slots),
+    )
+    b_hat_hist = none_to_nan_array(
+        model_params.get("b_hat_hist"),
+        shape=(W + 1,),
+    )
+    b_tilde_hist = none_to_nan_array(
+        model_params.get("b_tilde_hist"),
+        shape=(W + 1,),
+    )
+    return A_hist, pi_A_hist, b_hat_hist, b_tilde_hist
+
+
 def require_key(state: dict, key: str) -> Any:
     if key not in state or state[key] is None:
         raise KeyError(f"state must include {key!r}")
@@ -255,6 +284,139 @@ def stored_float(db_reader: DBReader, stored_value_type: str) -> float | None:
     return coerce_optional_float(stored)
 
 
+def model_params_from_reader(db_reader: DBReader) -> dict | None:
+    """Read current RL model parameters from ``db_reader.get_retrieved_data()``."""
+    if db_reader is None:
+        return None
+    data = db_reader.get_retrieved_data() or {}
+    for key in ("model_params", "current_model_params", "rl_model_params"):
+        value = data.get(key)
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+DEFAULT_B_HAT_STORED_VALUE_TYPE = "rl_b_hat"
+DEFAULT_B_TILDE_STORED_VALUE_TYPE = "rl_b_tilde"
+DEFAULT_PF_STATE_STORED_VALUE_TYPE = "rl_pf_state"
+DEFAULT_PF_STATE_HISTORY_STORED_VALUE_TYPE_PREFIX = "rl_pf_state_week"
+
+
+def belief_stored_values(
+    config: dict,
+    user_id: str,
+    b_hat: float,
+    b_tilde: float,
+) -> list[StoredValue]:
+    return [
+        StoredValue(
+            user_id=str(user_id),
+            type=str(
+                config.get(
+                    "b_hat_stored_value_type",
+                    DEFAULT_B_HAT_STORED_VALUE_TYPE,
+                )
+            ),
+            value=float(b_hat),
+        ),
+        StoredValue(
+            user_id=str(user_id),
+            type=str(
+                config.get(
+                    "b_tilde_stored_value_type",
+                    DEFAULT_B_TILDE_STORED_VALUE_TYPE,
+                )
+            ),
+            value=float(b_tilde),
+        ),
+    ]
+
+
+def pf_state_stored_values(
+    config: dict,
+    user_id: str,
+    *,
+    packet: dict,
+    pf_update: dict,
+    b_hat: float,
+    b_tilde: float,
+    rng_state: dict,
+) -> list[StoredValue]:
+    k = int(packet["k"])
+    value = {
+        "k": k,
+        "b_hat": float(b_hat),
+        "b_tilde": float(b_tilde),
+        "pf_update": pf_update,
+        "rng_state": rng_state,
+    }
+    latest_type = str(
+        config.get(
+            "pf_state_stored_value_type",
+            DEFAULT_PF_STATE_STORED_VALUE_TYPE,
+        )
+    )
+    history_prefix = str(
+        config.get(
+            "pf_state_history_stored_value_type_prefix",
+            DEFAULT_PF_STATE_HISTORY_STORED_VALUE_TYPE_PREFIX,
+        )
+    )
+    return [
+        StoredValue(
+            user_id=str(user_id),
+            type=latest_type,
+            value=value,
+        ),
+        StoredValue(
+            user_id=str(user_id),
+            type=f"{history_prefix}_{k}",
+            value=value,
+        ),
+    ]
+
+
+def stored_pf_state(config: dict, db_reader: DBReader) -> dict | None:
+    if db_reader is None:
+        return None
+    stored = db_reader.get_stored_value(
+        str(
+            config.get(
+                "pf_state_stored_value_type",
+                DEFAULT_PF_STATE_STORED_VALUE_TYPE,
+            )
+        )
+    )
+    if stored is None or not isinstance(stored.value, dict):
+        return None
+    return stored.value
+
+
+def stored_belief(
+    config: dict, db_reader: DBReader
+) -> tuple[float | None, float | None]:
+    return (
+        stored_float(
+            db_reader,
+            str(
+                config.get(
+                    "b_hat_stored_value_type",
+                    DEFAULT_B_HAT_STORED_VALUE_TYPE,
+                )
+            ),
+        ),
+        stored_float(
+            db_reader,
+            str(
+                config.get(
+                    "b_tilde_stored_value_type",
+                    DEFAULT_B_TILDE_STORED_VALUE_TYPE,
+                )
+            ),
+        ),
+    )
+
+
 DEFAULT_Y1_OBSERVATION_TYPE = "rl_Y_1"
 
 
@@ -301,6 +463,16 @@ def y1_from_reader(
     return None
 
 
+def resolve_y1(db_reader: DBReader | None, config: dict, user_id: str) -> float:
+    """Baseline CAE ``Y_1`` from observations, falling back to config."""
+    observed = y1_from_reader(db_reader, config, user_id)
+    return (
+        float(observed)
+        if observed is not None
+        else float(config.get("Y_1", 0.0))
+    )
+
+
 def infer_p_rl(state: dict) -> int:
     """Infer RLSVI feature dimension from the state produced by ``make_state``."""
     _, d, t = state_index(state)
@@ -311,6 +483,18 @@ def infer_p_rl(state: dict) -> int:
 def state_key(k: int, d: int, t: int) -> str:
     """History key using 0-indexed internal week ``k`` (array index)."""
     return f"{int(k)}:{int(d)}:{int(t)}"
+
+
+def state_hist_lookup(state_hist: dict[str, dict]):
+    """Build ``get_state(k, d, t)`` for ``build_rl_training_data``."""
+
+    def get_state(k: int, d: int, t: int) -> dict:
+        key = state_key(k, d, t)
+        if key not in state_hist:
+            raise KeyError(f"missing RL state for {key}")
+        return feature_state(deserialize_state(state_hist[key]))
+
+    return get_state
 
 
 def serialize_state(state: dict) -> dict:
