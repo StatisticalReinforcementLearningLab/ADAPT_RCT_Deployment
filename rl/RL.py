@@ -84,6 +84,7 @@ from RL_agents.rl.other_helpers import (
     to_float_array,
     to_int_array,
     validate_feature_dimension,
+    y1_from_reader,
 )
 
 
@@ -97,7 +98,6 @@ DEFAULT_B_TILDE_STORED_VALUE_TYPE = "rl_b_tilde"
 DEFAULT_PF_STATE_STORED_VALUE_TYPE = "rl_pf_state"
 DEFAULT_PF_STATE_HISTORY_STORED_VALUE_TYPE_PREFIX = "rl_pf_state_week"
 DEFAULT_EW_STORED_VALUE_TYPE = "rl_E_w"
-DEFAULT_Y1_OBSERVATION_TYPE = "rl_Y_1"
 
 
 def _resolve_local_path(path_value: str | Path | None) -> Path | None:
@@ -205,40 +205,6 @@ class RL(ActionHandlerBase):
         seed = self.config.get("seed")
         return stable_seed(user_id) if seed is None else int(seed)
 
-    def _y1_observation_type(self) -> str:
-        return str(
-            self.config.get("y_1_observation_type", DEFAULT_Y1_OBSERVATION_TYPE)
-        )
-
-    def _y1_from_reader(self, db_reader: DBReader | None) -> float | None:
-        """Read the per-participant baseline outcome ``Y_1`` from observations.
-
-        The server records ``Y_1`` in an :class:`ObservationRecord`. It is found
-        either in any observation payload under key ``Y_1``/``Y1``, or in the
-        payload ``value`` of an observation whose ``observation_type`` matches
-        ``y_1_observation_type`` (default ``"rl_Y_1"``). Returns ``None`` when no
-        usable value is present so callers can fall back to config.
-        """
-        if db_reader is None:
-            return None
-        obs_type = self._y1_observation_type()
-        try:
-            observations = db_reader.get_observations() or []
-        except TypeError:
-            observations = db_reader.get_observations
-        for obs in observations:
-            payload = getattr(obs, "payload", {}) or {}
-            value = payload.get("Y_1", payload.get("Y1"))
-            if value is None and getattr(obs, "observation_type", None) == obs_type:
-                value = payload.get("value")
-            if value is None:
-                continue
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                continue
-        return None
-
     def get_initial_model_params(
         self,
         user_id: str,
@@ -276,7 +242,7 @@ class RL(ActionHandlerBase):
         # per-participant baseline outcome Y_1 anchors the particle-filter CAE
         # trajectory, not b_hat. Y_1 is read from the ObservationRecord via
         # db_reader when available, falling back to config otherwise.
-        y1_observed = self._y1_from_reader(db_reader)
+        y1_observed = y1_from_reader(db_reader, self.config, user_id)
         Y_1 = (
             float(y1_observed)
             if y1_observed is not None

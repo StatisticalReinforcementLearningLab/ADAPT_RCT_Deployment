@@ -255,6 +255,52 @@ def stored_float(db_reader: DBReader, stored_value_type: str) -> float | None:
     return coerce_optional_float(stored)
 
 
+DEFAULT_Y1_OBSERVATION_TYPE = "rl_Y_1"
+
+
+def y1_observation_type(config: dict) -> str:
+    return str(config.get("y_1_observation_type", DEFAULT_Y1_OBSERVATION_TYPE))
+
+
+def y1_from_reader(
+    db_reader: DBReader | None,
+    config: dict,
+    user_id: str,
+) -> float | None:
+    """Read the per-participant baseline outcome ``Y_1`` from observations.
+
+    The server records ``Y_1`` in an :class:`ObservationRecord`. It is found
+    either in any observation payload under key ``Y_1``/``Y1``, or in the
+    payload ``value`` of an observation whose ``observation_type`` matches
+    ``y_1_observation_type`` (default ``"rl_Y_1"``). Only observations whose
+    ``user_id`` matches ``user_id`` are considered. Returns ``None`` when no
+    usable value is present so callers can fall back to config.
+    """
+    if db_reader is None:
+        return None
+    obs_type = y1_observation_type(config)
+    uid = str(user_id)
+    try:
+        observations = db_reader.get_observations() or []
+    except TypeError:
+        observations = db_reader.get_observations
+    for obs in observations:
+        obs_uid = getattr(obs, "user_id", None)
+        if obs_uid is not None and str(obs_uid) != uid:
+            continue
+        payload = getattr(obs, "payload", {}) or {}
+        value = payload.get("Y_1", payload.get("Y1"))
+        if value is None and getattr(obs, "observation_type", None) == obs_type:
+            value = payload.get("value")
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def infer_p_rl(state: dict) -> int:
     """Infer RLSVI feature dimension from the state produced by ``make_state``."""
     _, d, t = state_index(state)
