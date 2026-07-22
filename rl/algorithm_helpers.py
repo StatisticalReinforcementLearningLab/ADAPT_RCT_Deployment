@@ -185,13 +185,28 @@ def empirical_bayes_sigma2(X, y, mu_0, Sigma_0, fallback=1.0):
 
 
 def empirical_bayes_sigma2_ensemble(X, targets_per_b, mu_0, Sigma_0, fallback=1.0):
-    """Average empirical-Bayes ``sigma2`` across ensemble target vectors."""
+    """Average empirical-Bayes ``sigma2`` across ensemble target vectors.
+
+    Returns ``(sigma2, info)`` where ``info["used_fallback"]`` is True when no
+    ensemble member produced a finite estimate and ``fallback`` was retained.
+    """
     vals = []
+    B = len(targets_per_b)
     for y_b in targets_per_b:
         s2 = empirical_bayes_sigma2(X, y_b, mu_0, Sigma_0, fallback)
         if np.isfinite(s2):
             vals.append(s2)
-    return float(np.mean(vals)) if vals else float(fallback)
+    used_fallback = len(vals) == 0
+    sigma2_out = float(np.mean(vals)) if vals else float(fallback)
+    info = {
+        "used_fallback": used_fallback,
+        "partial_fallback": (not used_fallback and len(vals) < B),
+        "n_finite": len(vals),
+        "n_ensemble": B,
+        "sigma2": sigma2_out,
+        "fallback": float(fallback),
+    }
+    return sigma2_out, info
 
 
 def compute_rlsvi_betas(Phi, targets_per_b, mu_0, Sigma_0, sigma2, gamma_bar, z_prev, rng):

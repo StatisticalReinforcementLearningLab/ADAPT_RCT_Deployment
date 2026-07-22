@@ -10,7 +10,6 @@ from RL_agents.base import DBReader, StoredValue
 from RL_agents.logging_config import YELLOW, get_logger, log_alert
 from RL_agents.rl.algorithm_helpers import empirical_bayes_sigma2, spd_inverse
 from RL_agents.rl.other_helpers import (
-    belief_stored_values,
     deserialize_state,
     internal_week_index,
     jsonable_float_array,
@@ -191,37 +190,28 @@ def prepare_belief_fallback(
     log_alert(
         logger,
         YELLOW,
-        "PF prepare failed; using latest stored belief",
+        "weekly PF update failed; b_hat_hist/b_tilde_hist left unset for this week; "
+        "make_state will use latest stored b_hat/b_tilde if context omits them",
         action_type=action_type,
         user_id=str(user_id),
         reason=reason,
         error=error,
     )
     b_hat, b_tilde = stored_belief(config, db_reader)
-    if b_hat is None or b_tilde is None:
-        return None, [packet] if packet is not None else None
-
-    action_ids = action_ids_for_pf_reward(
-        db_reader, packet or {}, action_type=action_type
-    )
-    for action_id in action_ids:
-        rewards[int(action_id)] = float(b_hat)
 
     transformed = None
     if packet is not None:
-        transformed = [
-            {
-                **packet,
-                "pf_result": {
-                    "fallback": True,
-                    "reason": reason,
-                    "b_hat": float(b_hat),
-                    "b_tilde": float(b_tilde),
-                    "reward_action_ids": action_ids,
-                },
-            }
-        ]
-    return belief_stored_values(config, user_id, b_hat, b_tilde), transformed
+        pf_result: dict = {
+            "fallback": True,
+            "reason": reason,
+            "reward_action_ids": [],
+        }
+        if b_hat is not None:
+            pf_result["b_hat"] = float(b_hat)
+        if b_tilde is not None:
+            pf_result["b_tilde"] = float(b_tilde)
+        transformed = [{**packet, "pf_result": pf_result}]
+    return None, transformed
 
 
 def initial_pf_state(*, J: int, Y_1: float) -> dict[str, Any]:

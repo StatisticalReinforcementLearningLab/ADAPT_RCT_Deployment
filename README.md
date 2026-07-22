@@ -201,74 +201,55 @@ Default policy settings live in `rl/config.json`:
 
 ### RL State Inputs
 
-`RL.make_state(...)` accepts a context dictionary containing the feature-builder
-state for one decision point.
+`RL.make_state(...)` uses a thin request context plus `db_reader` covariates /
+beliefs (same observation-sourced contract as the PF packet and `update`).
 
 Week indexing:
 
 - Query and RL both use 1-indexed study week `w` at the API/state boundary
   (`w = 1` is enrollment/baseline)
-- accepted incoming aliases: `w`, `rl_week`, `week` (all 1-indexed)
-- legacy serialized states that only have 0-indexed `k` are converted via
-  `w = k + 1` on deserialize
+- preferred: derive `(w, d, t)` from `decision_time` + `timezone` and
+  `participantinfo` enrollment date (Mon–Sat RL days; slot from wakeup+1h /
+  wakeup+6h when wakeup is present, else local hour `< 14` → morning)
+- fallback for tests / legacy: explicit `w` (aliases `rl_week` / `week`),
+  `d`/`day`, `t`/`slot`
 - RL array math still uses local `k = w - 1` (e.g. `A_hist[k, d, t]`);
   PF packets retain that internal `k`
 
-Required decision index fields:
+Required context fields:
 
-- `w` (or alias `rl_week` / `week`)
-- `d` or `day`: 0-indexed day within the RL week
-- `t` or `slot`: 0-indexed decision slot within the day
+- `decision_time` (or `decisionTime` / `timestamp`) and `timezone`
+  **or** explicit `w`, `d`/`day`, `t`/`slot`
+- `availability` (aliases `available` / `is_available`): when false,
+  `get_action` returns `A=0` with probability 0
 
-Required feature fields:
+Feature / belief fields are **not** taken from context. `make_state` uses a
+direct per-decision lookup (`lookup_decision_covariates`), not the full-week
+PF series:
 
-- `E_w`, or `perceivedUtility`
-- `M_Y`: mediator matrix with up to 6 rows and 3 columns
-- `M_E`: mediator matrix with up to 6 rows and 4 columns
-- `C`: 8-element context vector
+| Field | Source |
+|-------|--------|
+| `C` | observation / retrieved_data for the current `(w, d, t)` slot |
+| `M_Y`, `M_E` | week-`w` observation matrices |
+| `E_w` | stored value `rl_E_w` |
+| `b_hat`, `b_tilde` | stored values `rl_b_hat` / `rl_b_tilde` |
 
-Instead of `C`, callers may provide the raw context fields:
-
-- `yesterdayStepCount`
-- `stepCountLast7DaysEma`
-- `prior2HourStepCountAgent`
-- `activityCompletedLast7Days`
-- `activeDaysLast7Days`
-- `activitySuggestionsSentLast7Days`
-- `salienceMessageSentYesterday`
-- `activitySuggestionInteractLast7Days`
-
-Belief fields:
-
-- `b_hat`
-- `b_tilde`
-
-If `b_hat` or `b_tilde` are missing, `make_state(...)` tries to read them from
-the framework stored values named in `rl/config.json`:
-
-- `rl_b_hat`
-- `rl_b_tilde`
-
-At baseline week `w = 1`, missing beliefs default to `0.0`.
-
-If `E_w`/`perceivedUtility` is missing from the context, `make_state(...)` reads
-the perceived utility from the stored value `rl_E_w`, which the weekly E_w update
-in `prepare_for_update(...)` maintains.
+At baseline week `w = 1`, missing `b_hat` falls back to observed `Y_1` and
+missing `b_tilde` / `E_w` default to `0.0`. Missing slot `C` zeros out with a
+yellow alert. When `standardize_context` is true, observation-sourced
+`C` / `M_Y` / `M_E` are model-scaled in the same overlay path used by `update`.
 
 ### Minimal RL Context Example
 
 ```python
 context = {
-    "w": 2,              # 1-indexed study week (same as Query); arrays use k = w - 1
-    "d": 0,
-    "t": 0,
-    "E_w": 0.3,
-    "M_Y": [[0, 0, 0]] * 6,
-    "M_E": [[0, 0, 0, 0]] * 6,
-    "C": [0, 0, 0, 0, 0, 0, 0, 0],
-    "b_hat": 0.0,
-    "b_tilde": 0.0,
+    "decision_time": "2026-07-13T09:00:00-04:00",
+    "timezone": "America/New_York",
+    "availability": True,
 }
+
+# Test / legacy fallback when no timestamp is provided:
+# context = {"w": 2, "d": 0, "t": 0, "availability": True}
 
 state_result = rl_handler.make_state("participant-001", context, db_reader)
 action_result = rl_handler.get_action(
@@ -287,11 +268,13 @@ The deployment framework typically calls updates in two phases.
    - reads recent observations from `db_reader.get_observations()`
    - extracts explicit rewards from observation payloads containing
      `action_id` plus `reward`, `CAE`, or `cae`
-   - consumes the latest particle-filter packet when available, runs the
-     particle-filter belief update, refits the online noise variances, and
-     assigns the belief mean `b_hat` as the weekly reward
-   - runs the weekly perceived-utility (`E_w`) update from pooled linear
-     coefficients and stores the result under `rl_E_w`
+   - builds a PF packet from general-name series in `db_reader` (or uses a
+     pre-assembled `rl_pf_packet` / `pf_packet` observation when it already
+     includes `pf_data`), runs the particle-filter belief update, and assigns
+     the belief mean `b_hat` as the weekly reward
+   - builds weekly perceived-utility (`E_w`) inputs from `M_E` + weekly
+     check-in (or uses pre-assembled `ew_inputs`), applies pooled linear
+     coefficients, and stores the result under `rl_E_w`
    - returns rewards, stored belief/PF/`E_w` values, and transformed observations
 
 2. `update(...)`
@@ -304,99 +287,139 @@ The deployment framework typically calls updates in two phases.
    - refits the RLSVI ensemble when enough historical states and rewards exist
    - returns updated `model_params` and any stored values that should be saved
 
-Particle-filter packets are accepted in observation payloads with type
-`rl_pf_packet` or `pf_packet`. A packet can use external `w` or internal `k`;
-external `w` is converted to `k = w - 1`.
+Pre-assembled PF packets (optional) may still use observation type
+`rl_pf_packet` / `pf_packet` with external `w` or internal `k`
+(`w` → `k = w - 1`).
 
-## Server-Built Data Contract (PF packet + E_w inputs)
+## Data Contract (PF packet + E_w inputs)
 
-The handler consumes weekly design matrices and aggregates; it does **not** build
-them. The deployment/server side is responsible for assembling them from the
-database for the just-finalized week and delivering them as observation payloads.
-This section specifies exactly what to build.
+`prepare_for_update` **builds** the PF design matrices (`pf_data`) from
+general-name series in `db_reader` (actions + observations) via
+`RL_agents.rl.pf_packet_builder.build_pf_packet_from_reader`. A pre-assembled
+`rl_pf_packet` observation with `pf_data` is still accepted for backward
+compatibility when present.
+
+The server should provide the general-name fields below (per week / slot) so the
+handler can construct the packet. This section specifies that contract.
 
 ### Perceived-utility (E_w) inputs
 
 The weekly `E_w` update applies pooled, no-intercept linear coefficients
-(`Ew_pooled_linear_coefs.json`) to five weekly aggregates. Provide them under an
-`ew_inputs` dict, either inside the PF packet (`packet["ew_inputs"]`), inside any
-observation payload (`payload["ew_inputs"]`), or as an observation of type
-`rl_ew_inputs` whose payload is the inputs dict itself.
+(`Ew_pooled_linear_coefs.json`) to the paper proxy
 
-| Field | Meaning | How to build from the database |
-|-------|---------|--------------------------------|
-| `J_w` | Week-present / survey indicator (0 or 1) | Whether the week's survey was completed |
-| `PV_sum` | Mean of the 14 standardized per-slot pageview counts | `mean(HourlyPageviewCount_norm)` over the 14 decision slots |
-| `FW_sum` | Mean over 7 days of `nextday_wearing` | `nansum(nextday_wearing) / 7` (first row per day) |
-| `PJ_sum` | Mean over 7 days of `daily_present` | `nansum(daily_present) / 7` (first row per day) |
-| `half_J_tool8` *(optional)* | `0.5 * J_w * ((U1+1) + (U2+1)) / 8` | Provide directly, **or** provide `U1`/`U2` (aliases `Exp-tool-1`/`Exp-tool-2`) and the handler derives it (missing ratings default to 0) |
+\[
+\widehat e_w
+=
+\omega_1 J_w^{\mathrm{week}}
++
+\omega_2 J_w^{\mathrm{week}}\frac{U_{w,1}+U_{w,2}}{14}
++
+\omega_3 \overline M_{w-1}^{E,PJ}
++
+\omega_4 \overline M_{w-1}^{E,PV}
++
+\omega_5 \overline M_{w-1}^{E,FW}.
+\]
 
-If `ew_inputs` is absent, the E_w update is skipped. If it is present but missing
-`PV_sum`/`FW_sum`/`PJ_sum`, a yellow "perceived-utility (E_w) update failed" alert
-is logged and E_w is left unchanged. The resulting `E_w` is stored under `rl_E_w`
-and used by `make_state` for the following week's decisions when the request
-context omits `E_w`/`perceivedUtility`.
+`prepare_for_update` **builds** these aggregates via
+`RL_agents.rl.ew_helpers.build_ew_inputs_from_reader` from:
 
-### PF packet
+1. **`M_E` summaries of week `w-1`** (action states and/or week observations)
+2. **Weekly check-in** fields `J_w`, `U1`/`U2` (`Exp-tool-1`/`Exp-tool-2`)
 
-Deliver one packet per completed RL week as an observation with type
-`rl_pf_packet` (or a payload containing `pf_data`/`pf_packet`).
+A pre-assembled `ew_inputs` dict is still accepted when present
+(`packet["ew_inputs"]`, `payload["ew_inputs"]`, or observation type
+`rl_ew_inputs`).
 
-| Packet field | Type | Meaning |
-|--------------|------|---------|
-| `w` or `k` | int | Prefer 1-indexed study week `w` (converted to internal `k = w - 1`); raw `k` is the 0-indexed PF/array week |
-| `I_w` | 0/1 | Query arm this week (1 = full CAE observed, 0 = short CAE observed) |
-| `J_w` | 0/1 or null | Week-present gate; if `!= 1`, no CAE outcome is used this week |
-| `Y_prev` / `Y_w` | float or null | Full weekly CAE from the finalized week (used when `I_w = 1`) |
-| `tY_prev` / `tilde_Y_w` | float or null | Short CAE from the finalized week (used when `I_w = 0`) |
-| `action_ids` *(optional)* | list[int] | Action ids of the completed week to receive the belief reward; if omitted, the handler matches actions whose internal week equals `k - 1` |
-| `ew_inputs` *(optional)* | dict | E_w inputs (see above) |
-| `pf_data` | dict | Particle-filter design matrices (see below) |
+| Field | Paper symbol | Source |
+|-------|--------------|--------|
+| `J_w` | \(J_w^{\mathrm{week}}\) | Weekly check-in completed (0/1) |
+| `U1` / `U2` | \(U_{w,1}\), \(U_{w,2}\) | RCT 1–7 helpfulness / pleasantness (`Exp-tool-1` / `Exp-tool-2`); no shift |
+| `half_J_tool8` | \(J_w(U_{w,1}+U_{w,2})/14\) | Derived from `J_w` and `U1`/`U2` when omitted (coef key name is historical) |
+| `PJ_sum` | \(\overline M_{w-1}^{E,PJ}\) | Mean of `M_E[:, 3]` over 7 days (daily check-in surrogate) |
+| `FW_sum` | \(\overline M_{w-1}^{E,FW}\) | Mean of `M_E[:, 2]` over 7 days (Fitbit wear) |
+| `PV_sum` | \(\overline M_{w-1}^{E,PV}\) | `nansum` of slot pageviews `M_E[:, 0:2]` over 14 calendar slots, divided by 14 |
 
-### `pf_data` fields
+`M_E` is the RL `(≤7)×4` matrix: cols 0–1 = pageview slots, col 2 = wear, col 3 =
+daily present. Mon–Sat-only matrices are padded with zeros for Sunday so the
+denominators stay 7 / 14.
 
-Let `K14 = 14` (slots/week), `N_MED_SLOT = 12` (Mon–Sat × 2 slots), and
-`N_MED_ANTIC_DAY = 6` (Mon–Sat). `sim_w_prev = k - 1` is the just-finalized week.
-The two mediator models are index 0 = "fourSC" (per-slot step-count next-4h) and
-index 1 = "antic" (per-day anticipated affect). Cumulative arrays cover weeks
-`0 .. sim_w_prev - 1` and are `null` until `k >= 2`.
+If inputs cannot be built, the E_w update is skipped. If aggregates are present
+but invalid, a yellow "perceived-utility (E_w) update failed" alert is logged
+and E_w is left unchanged. The resulting value is stored under `rl_E_w` and used
+by `make_state` when the request context omits `E_w`/`perceivedUtility`.
 
-Current-week design (always present):
+### PF inputs from `db_reader` (general names)
+
+The builder reads **actions** (`ActionRecord.state` / `action`) and optional weekly
+observations (type `rl_pf_week` / `pf_week`, or any payload with a week index
+`w`/`k` plus the fields below).
+
+| General name | Source | Meaning |
+|--------------|--------|---------|
+| `C` | observation / retrieved_data only (not action state) | Per-slot baseline covariate vector (RLSVI length 9); server streams as available; action-time `state["C"]` is for replicability only |
+| `A` | `ActionRecord.action` or week payload | Binary walking suggestion |
+| `E_w` | action state / week payload / stored `rl_E_w` | Perceived utility for the week |
+| `M_Y` / `M^Y` | observation only (not action state) | Cols 0–1 = fourSC slots; col 2 = antic day |
+| `M_E` / `M^E` | week payload `(≤7,4)` | Cols 0–1 = pageview; col 2 = Fitbit wear; col 3 = daily present (also used for E_w) |
+| `Exp-tool-1` / `Exp-tool-2` | weekly check-in payload | RCT 1–7 app helpfulness / pleasantness for E_w |
+| `Y` / `CAE` | week payload | Full weekly CAE for the finalized week |
+| `Y_tilde` / `tilde_Y` / `CAE_short` | week payload | Short CAE |
+
+When `standardize_context` is true, `prepare_for_update` rebuilds the PF packet via
+`build_pf_packet_from_reader(..., std_params=...)` and model-scales raw
+observation fields **before** design rows: `C` counts/burden, fourSC
+`log1p`+z, anticipated affect 1–7→[-1,1], CAE / short CAE / `Y_1` z-score,
+`todayStepCount` `log1p`+z.
+| `I_w` | week payload | Query arm (1 = full CAE, 0 = short CAE) |
+| `J_w` / `wp` | week payload | Week-present gate |
+| `wear7` *(optional)* | state or payload | `morningFitbitWearLast7Days` if not packed in `C[8]` |
+| `antic_covariates` *(optional)* | week payload | Day-level antic covariates (`todayStepCount`, …) |
+
+#### `C` → fourSC column map (current dims; may change later)
+
+| `C[i]` | fourSC baseline role |
+|--------|----------------------|
+| `C[0]` | yesterdayStepCount |
+| `C[1]` | stepCountLast7DaysEma |
+| `C[2]` | prior2HourStepCount |
+| `C[3]` | activityCompletedLast7Days |
+| `C[4]` | activeDaysLast7Days |
+| `C[5]` | activitySuggestionsSentLast7Days |
+| `C[6]` | salienceMessageSentYesterday |
+| `C[7]` | activitySuggestionInteractLast7Days |
+| `C[8]` | morningFitbitWearLast7Days when `wear7` omitted |
+
+`dayOfWeekNorm` and `decisionTimeSlot` are derived from `(d, t)`. Action
+interactions and the CAE particle columns are filled by the row builders /
+`cae_delta_*` (CAE base = 0; particles substitute at update time).
+
+If a full server packet with `pf_data` is already in observations, it is used
+as-is. Otherwise the handler builds one. On build/update failure, the existing
+belief-fallback path runs (`b_hat_hist` left unset for that week).
+
+### Built `pf_data` shapes (unchanged contract)
+
+Let `N_MED_SLOT = 12` (Mon–Sat × 2), `N_MED_ANTIC_DAY = 6`, and CAE features pad
+to a 7-day calendar (`14` fourSC + `7` antic). `sim_w_prev = k - 1`.
+Mediator index 0 = fourSC (dim 25), index 1 = antic (dim 19). Cumulative arrays
+cover weeks `0 .. sim_w_prev - 1` and are `null` until `k >= 2`.
 
 | Field | Shape | Content |
 |-------|-------|---------|
-| `X_MY_base` | `[ (12, p_fourSC), (6, p_antic) ]` | Mediator design rows for the current week with the CAE column zeroed |
-| `cae_delta_MY` | same shapes | Per-row deltas marking where the per-particle CAE is substituted |
-| `M_Y_obs` | `[ (12,), (6,) ]` | Observed mediators (`stepCountNext4Hour`, `dailyAnticipatedAffect`); `NaN` where unobserved |
-| `X_Y_base` | `(24,)` | CAE transition design for the current week (CAE AR slot zeroed) |
-| `cae_delta_Y` | `(24,)` | Zeros except the AR-1 CAE column = 1 |
-| `X_tY_base` | `(2,)` | Short-CAE design, `[1, 0]` |
-| `cae_delta_tY` | `(2,)` | Short-CAE CAE slot, `[0, 1]` |
-| `cae_all_0` | float | Baseline CAE (AR seed) at index 0 |
+| `X_MY_base` | `[ (12, 25), (6, 19) ]` | Mediator design rows (CAE column zeroed) |
+| `cae_delta_MY` | same shapes | Per-particle CAE substitution deltas |
+| `M_Y_obs` | `[ (12,), (6,) ]` | Observed mediators; `NaN` where unobserved |
+| `X_Y_base` | `(24,)` | CAE transition design (AR CAE slot zeroed) |
+| `cae_delta_Y` | `(24,)` | AR-1 CAE column = 1 |
+| `X_tY_base` / `cae_delta_tY` | `(2,)` | Short-CAE design `[1,0]` / `[0,1]` |
+| `cae_all_0` | float | Baseline CAE (`Y_1`) |
 | `sim_w_prev` | int | `k - 1` |
+| cumulative `X_cumul_*` / `y_cumul_*` | (when `k >= 2`) | Complete-case history |
 
-Cumulative history (present when `k >= 2`, else `null`):
-
-| Field | Shape | Content |
-|-------|-------|---------|
-| `X_cumul_MY_base` | `[ (n0, p_fourSC), (n1, p_antic) ]` | Mediator rows across past weeks (complete cases) |
-| `cae_delta_cumul_MY` | same shapes | CAE deltas for the cumulative rows |
-| `week_idx_cumul_MY` | `[ (n0,), (n1,) ]` | Week index of each cumulative mediator row (for per-particle CAE lookup) |
-| `y_cumul_MY` | `[ (n0,), (n1,) ]` | Observed mediator responses (finite only) |
-| `X_cumul_Y_base` | `(sim_w_prev, 24)` | CAE transition design for weeks `0 .. sim_w_prev - 1` |
-| `cae_delta_cumul_Y` | `(sim_w_prev, 24)` | AR-1 CAE column = 1 per week |
-| `y_cumul_Y` | `(sim_w_prev,)` | CAE trajectory targets (filled per-particle at update time) |
-| `X_cumul_tY` | `(n_jw, 2)` | Short-CAE design for weeks where `J_w = 1` |
-| `cae_delta_cumul_tY` | `(n_jw, 2)` | Short-CAE CAE slot = 1 |
-| `week_idx_cumul_tY` | `(n_jw,)` | Week index of each short-CAE row |
-| `y_cumul_tY` | `(n_jw,)` | Observed short-CAE outcomes |
-
-The reference construction is `build_pf_data(...)` in the top-level
-`algorithm_helpers.py` (simulation code); the deployment build should reproduce
-the same shapes and column conventions from the participant's logged mediators,
-actions, CAE outcomes, and week indicators. `prepare_for_update` also needs the
-current `model_params` in `db_reader.get_retrieved_data()` under one of
-`model_params`, `current_model_params`, or `rl_model_params` to run the PF update.
+`prepare_for_update` also needs current `model_params` in
+`db_reader.get_retrieved_data()` under one of `model_params`,
+`current_model_params`, or `rl_model_params` to run the PF update.
 
 ## DBReader Contract
 

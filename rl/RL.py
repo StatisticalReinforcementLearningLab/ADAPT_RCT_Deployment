@@ -1,23 +1,32 @@
 """Framework-facing RL action handler.
 
 #TODO:
-1. Feature construction in make_state: what is provided via context? what is provided via db_reader?
-2. pf_packet construction in prepare_for_update
-3. how is delayed data handled in prepare_for_update or update
+1. missing data handling when observation-sourced C / mediators are delayed
+2. raw data processing for C / mediators
 
 This is the base RL algorithm handler. It is used to train the RL model and to make actions.
 
-Expected state/context fields
+Expected ``make_state`` inputs
 -----------------------------
-``make_state`` accepts a context dict that already contains the feature-builder
-state used by ``RL_agents.rl.algorithm_helpers.build_phi_action``:
+Request ``context`` provides only the decision identity and MRT eligibility:
 
-    E_w, M_Y, M_E, C, w, d, t
+    decision_time (or timestamp), timezone, availability
 
-Study week ``w`` is 1-indexed (``w=1`` is the first week of RL/active phase).
-Array indexing inside this handler uses ``k = w - 1``.
-If omitted,``make_state`` reads beliefs / ``E_w`` from ``DBReader.get_stored_value()``
-using the stored value types in ``config.json``.
+``(w, d, t)`` are derived from the decision timestamp plus enrollment metadata in
+``db_reader.get_retrieved_data()["participantinfo"]`` (same week convention as
+Query). Explicit ``w`` / ``d`` / ``t`` remain accepted as a test / legacy fallback.
+
+Feature fields are **not** read from context. They come from ``db_reader`` via
+a direct per-decision observation lookup (not the full-week PF series):
+
+- ``C``: observation / retrieved_data for the current ``(w, d, t)`` slot
+- ``M_Y``, ``M_E``: week-``w`` observation matrices
+- ``E_w``: stored value ``rl_E_w`` (weekly EW update)
+- ``b_hat``, ``b_tilde``: stored beliefs (``rl_b_hat`` / ``rl_b_tilde``);
+  at baseline week ``w=1``, missing ``b_hat`` falls back to observed ``Y_1``
+
+Study week ``w`` is 1-indexed (``w=1`` is enrollment / baseline). Array indexing
+inside this handler uses ``k = w - 1``.
 """
 
 from __future__ import annotations
@@ -41,6 +50,7 @@ from RL_agents.base import (
 )
 from RL_agents.logging_config import RED, YELLOW, GREEN, get_logger, log_alert
 from RL_agents.rl.algorithm_helpers import (
+    N_RL_DAYS,
     betas_for_action,
     build_phi_action,
     build_rl_training_data,
@@ -65,13 +75,19 @@ from RL_agents.rl.pf_helpers import (
     resolve_pf_priors,
     update_pf_belief,
 )
+from RL_agents.rl.ew_helpers import collect_ew_week_sources
+from RL_agents.rl.pf_packet_builder import (
+    build_pf_packet_from_reader,
+    collect_pf_week_series,
+)
 from RL_agents.rl.prior_helpers import (
     load_pf_priors,
     load_q_prior,
     resolve_q_priors,
 )
-from RL_agents.rl.standardization import load_std_params, standardize_context
+from RL_agents.rl.standardization import load_std_params
 from RL_agents.rl.other_helpers import (
+    apply_weekly_rewards_to_belief_hist,
     belief_stored_values,
     coerce_optional_float,
     coerce_state,
@@ -83,10 +99,15 @@ from RL_agents.rl.other_helpers import (
     jsonable_float_array,
     jsonable_int_array,
     model_params_from_reader,
-    normalize_study_week,
+    apply_decision_covariates,
+    lookup_decision_covariates,
     optional_state_index,
+    overlay_observation_covariates_on_state,
     pf_state_stored_values,
+    refresh_state_hist_from_observations,
     required_config,
+    resolve_availability,
+    resolve_decision_index,
     serialize_state,
     stable_seed,
     state_index,
@@ -304,47 +325,71 @@ class RL(ActionHandlerBase):
         db_reader: DBReader,
     ) -> StateResult:
         try:
-            # Normalize to 1-indexed study week w (same convention as Query).
-            # Array indexing inside this handler uses k = w - 1.
-            context_for_state = normalize_study_week(context)
-            # Perceived utility E_w: if the request context omits it, fall back to
-            # the value written weekly by prepare_for_update's E_w update.
-            if (
-                context_for_state.get("E_w") is None
-                and context_for_state.get("perceivedUtility") is None
-            ):
-                ew_stored = stored_float(db_reader, ew_stored_value_type(self.config))
-                if ew_stored is not None:
-                    context_for_state = {**context_for_state, "E_w": ew_stored}
-            if self.std_params is not None:
-                context_for_state = standardize_context(
-                    context_for_state, self.std_params
-                )
-            state = coerce_state(context_for_state)
-            b_hat = coerce_optional_float(state.get("b_hat"))
-            b_tilde = coerce_optional_float(state.get("b_tilde"))
+            # Context contract: decision timestamp (+ timezone) and availability.
+            # Features / beliefs come from db_reader (same sources as PF / update).
+            w, d, t = resolve_decision_index(context or {}, db_reader)
+            availability = resolve_availability(context or {})
+            k = internal_week_index(w)
+
+            ew = stored_float(db_reader, ew_stored_value_type(self.config))
+            if ew is None:
+                if w == 1:
+                    ew = 2.0
+                else:
+                    raise KeyError(
+                        "DBReader stored value must provide E_w "
+                        f"({ew_stored_value_type(self.config)})"
+                    )
+
+            b_hat, b_tilde = stored_belief(self.config, db_reader)
             if b_hat is None or b_tilde is None:
-                stored_b_hat, stored_b_tilde = stored_belief(self.config, db_reader)
-                if b_hat is None:
-                    b_hat = stored_b_hat
-                if b_tilde is None:
-                    b_tilde = stored_b_tilde
-            if b_hat is None or b_tilde is None:
-                w_idx, _, _ = optional_state_index(state)
-                if w_idx == 1:
-                    # Baseline week w=1 (internal k=0): use observed Y_1 when
-                    # beliefs are not yet in context/DB.
+                if w == 1:
                     if b_hat is None:
                         b_hat = resolve_y1(db_reader, self.config, user_id)
                     if b_tilde is None:
                         b_tilde = 0.0
                 else:
                     raise KeyError(
-                        "state must include b_hat/b_tilde or DBReader stored values "
-                        "must provide them"
+                        "DBReader stored values must provide b_hat/b_tilde"
                     )
-            state["b_hat"] = b_hat
-            state["b_tilde"] = b_tilde
+
+            # Skeleton defaults; per-slot / week observation lookup overwrites below.
+            skeleton = {
+                "w": w,
+                "d": d,
+                "t": t,
+                "availability": availability,
+                "E_w": float(ew),
+                "C": np.zeros(8, dtype=float),
+                "M_Y": np.zeros((N_RL_DAYS, 3), dtype=float),
+                "M_E": np.zeros((N_RL_DAYS, 4), dtype=float),
+                "b_hat": float(b_hat),
+                "b_tilde": float(b_tilde),
+            }
+            covariates = lookup_decision_covariates(
+                db_reader, k=k, d=d, t=t
+            )
+            if covariates.get("C") is None:
+                log_alert(
+                    logger,
+                    YELLOW,
+                    "RL make_state missing observation C for decision slot; using zeros",
+                    action_type=self.action_type,
+                    user_id=str(user_id),
+                    w=w,
+                    d=d,
+                    t=t,
+                )
+            state = apply_decision_covariates(
+                skeleton,
+                covariates=covariates,
+                std_params=self.std_params,
+            )
+            state = coerce_state(state)
+            state["availability"] = bool(availability)
+            state["b_hat"] = float(b_hat)
+            state["b_tilde"] = float(b_tilde)
+            state["E_w"] = float(ew)
         except (KeyError, TypeError, ValueError) as exc:
             log_alert(
                 logger,
@@ -368,6 +413,12 @@ class RL(ActionHandlerBase):
             state = deserialize_state(state)
             w, d, t = state_index(state)
             k = internal_week_index(w)
+            if not bool(state.get("availability", True)):
+                return ActionResult(
+                    action=0,
+                    action_prob=0.0,
+                    random_state={"unavailable": True, "w": w, "d": d, "t": t},
+                )
             validate_feature_dimension(
                 user_id=user_id,
                 action_type=self.action_type,
@@ -469,11 +520,46 @@ class RL(ActionHandlerBase):
         for obs in observations:
             payload = obs.payload or {}
             action_id = payload.get("action_id")
+            # TODO: CAE in the database maybe 12 items, rather than just 1. Need to handle this.
             reward = payload.get("reward", payload.get("CAE", payload.get("cae")))
             if action_id is None or reward is None:
                 continue
             rewards[int(action_id)] = float(reward)
+        # When standardize_context is on, always rebuild from db_reader so raw
+        # observation fields are model-scaled before PF design rows are formed.
+        # Pre-assembled packets with pf_data are only used when standardization
+        # is off (they are assumed already on model scale).
         packet = latest_pf_packet(observations)
+        if (
+            self.std_params is not None
+            or packet is None
+            or packet.get("pf_data") is None
+        ):
+            try:
+                built = build_pf_packet_from_reader(
+                    db_reader,
+                    action_type=self.action_type,
+                    config=self.config,
+                    user_id=user_id,
+                    nweek=int(self.config.get("W", 0)) or None,
+                    std_params=self.std_params,
+                )
+                if built is not None:
+                    packet = built
+                elif self.std_params is not None:
+                    # Standardization required a rebuild; do not fall back to a
+                    # raw pre-assembled pf_data packet.
+                    packet = None
+            except Exception as exc:
+                log_alert(
+                    logger,
+                    YELLOW,
+                    "PF packet construction from db_reader failed",
+                    action_type=self.action_type,
+                    user_id=str(user_id),
+                    error=str(exc),
+                )
+                packet = None
         transformed_observations = [packet] if packet is not None else None
         stored_values: list[StoredValue] | None = None
         if packet is not None and self.pf_priors:
@@ -489,6 +575,8 @@ class RL(ActionHandlerBase):
                 if model_params is not None:
                     if packet.get("k") is None:
                         raise KeyError("PF packet must include k or infer k from actions")
+                    if packet.get("pf_data") is None:
+                        raise KeyError("PF packet must include pf_data")
                     params = deepcopy(model_params)
                     rng = self._rng(params)
                     pf_update, b_hat_pf, b_tilde_pf = update_pf_belief(
@@ -561,8 +649,19 @@ class RL(ActionHandlerBase):
                     reason="pf_update_failed",
                     error=str(exc),
                 )
+        elif self.pf_priors and packet is None:
+            stored_values, transformed_observations = prepare_belief_fallback(
+                self.config,
+                action_type=self.action_type,
+                user_id=user_id,
+                db_reader=db_reader,
+                packet=None,
+                rewards=rewards,
+                reason="pf_packet_unavailable",
+            )
 
         # Weekly perceived-utility (E_w) update; independent of the PF/belief path.
+        # Builds ew_inputs from M_E + weekly check-in when not pre-assembled.
         ew_stored = prepare_ew_update(
             self.config,
             user_id,
@@ -570,6 +669,7 @@ class RL(ActionHandlerBase):
             packet,
             ew_coefs=self.ew_coefs,
             action_type=self.action_type,
+            db_reader=db_reader,
         )
         if ew_stored:
             stored_values = [*(stored_values or []), *ew_stored]
@@ -599,13 +699,34 @@ class RL(ActionHandlerBase):
         state_hist = dict(params.get("state_hist", {}))
         # Last observed belief; used as the fallback uncertainty when PF is
         # unavailable so b_tilde is carried forward rather than forced to 0.
-        latest_b_hat, latest_b_tilde = stored_belief(self.config, db_reader)
+        # TODO: check should we use 0 or b_tilde_pf from the latest PF packet?
+        _, latest_b_tilde = stored_belief(self.config, db_reader)
+
+        # Observation-sourced covariates for RLSVI training (same contract as PF):
+        # rebuild C / M_Y / M_E from db_reader; keep action-time E_w / b_hat / b_tilde.
+        pf_series = collect_pf_week_series(
+            db_reader, action_type=self.action_type, config=self.config
+        )
+        me_by_k = collect_ew_week_sources(
+            db_reader, action_type=self.action_type
+        )
 
         max_k_seen = -1
+        action_id_to_k: dict[int, int] = {}
         for record in actions:
             state = deserialize_state(record.state or record.context or {})
             w, d, t = state_index(state)
             k = internal_week_index(w)
+            me_entry = me_by_k.get(k) or {}
+            state = overlay_observation_covariates_on_state(
+                state,
+                k=k,
+                d=d,
+                t=t,
+                series=pf_series,
+                me_week=me_entry.get("M_E"),
+                std_params=self.std_params,
+            )
             validate_feature_dimension(
                 user_id=user_id,
                 action_type=self.action_type,
@@ -629,18 +750,29 @@ class RL(ActionHandlerBase):
             if not (0 <= k < W):
                 continue
             max_k_seen = max(max_k_seen, k)
+            action_id_to_k[int(record.action_id)] = k
             A_hist[k, d, t] = int(record.action)
             pi_A_hist[k, d, t] = float(record.action_prob)
             state_hist[state_key(k, d, t)] = serialize_state(state)
 
-            reward = rewards.get(record.action_id)
-            if reward is not None and k + 1 < b_hat_hist.size:
-                b_hat_hist[k + 1] = float(reward)
-                # Without PF, carry the last observed belief uncertainty forward.
-                # PF (if prepared) overrides b_tilde_hist below.
-                b_tilde_hist[k + 1] = (
-                    float(latest_b_tilde) if latest_b_tilde is not None else 0.0
-                )
+        # Also refresh older state_hist entries so TD training does not keep
+        # stale action-time C / mediators once the DB has completed values.
+        state_hist = refresh_state_hist_from_observations(
+            state_hist,
+            series=pf_series,
+            me_by_k=me_by_k,
+            std_params=self.std_params,
+        )
+
+        apply_weekly_rewards_to_belief_hist(
+            rewards,
+            action_id_to_k,
+            b_hat_hist,
+            b_tilde_hist,
+            latest_b_tilde=latest_b_tilde,
+            action_type=self.action_type,
+            user_id=str(user_id),
+        )
 
         params["A_hist"] = jsonable_int_array(A_hist)
         params["pi_A_hist"] = jsonable_float_array(pi_A_hist)
@@ -681,17 +813,12 @@ class RL(ActionHandlerBase):
             log_alert(
                 logger,
                 YELLOW,
-                "prepared PF state missing during update; using prepared rewards or latest stored belief",
+                "prepared PF state missing during update; b_hat_hist/b_tilde_hist "
+                "left unset for this week",
                 action_type=self.action_type,
                 user_id=str(user_id),
                 k=k_cur,
             )
-            if latest_b_hat is not None and not np.isfinite(b_hat_hist[k_cur]):
-                b_hat_hist[k_cur] = float(latest_b_hat)
-            if latest_b_tilde is not None:
-                b_tilde_hist[k_cur] = float(latest_b_tilde)
-            params["b_hat_hist"] = jsonable_float_array(b_hat_hist)
-            params["b_tilde_hist"] = jsonable_float_array(b_tilde_hist)
         stored_values = None
         if np.isfinite(b_hat_hist[k_cur]) and np.isfinite(b_tilde_hist[k_cur]):
             stored_values = [
@@ -701,7 +828,10 @@ class RL(ActionHandlerBase):
             ]
         if k_cur == 0:
             return UpdateResult(model_params=params, stored_values=stored_values)
-        if not np.isfinite(b_hat_hist[k_cur]):
+        # RLSVI needs the new-week belief and a usable E_w (from prepare_for_update's
+        # weekly perceived-utility update, or already present in stored values).
+        ew_for_update = stored_float(db_reader, ew_stored_value_type(self.config))
+        if not np.isfinite(b_hat_hist[k_cur]) or ew_for_update is None:
             return UpdateResult(model_params=params, stored_values=stored_values)
 
         mu_0 = np.asarray(params["mu_0_rl"], dtype=float)
@@ -756,9 +886,40 @@ class RL(ActionHandlerBase):
             return UpdateResult(model_params=params, stored_values=stored_values)
 
         try:
-            sigma2 = empirical_bayes_sigma2_ensemble(
+            sigma2, sigma2_eb_info = empirical_bayes_sigma2_ensemble(
                 Phi_rl, targets_rl, mu_0, Sigma_0, sigma2
             )
+            if sigma2_eb_info.get("used_fallback"):
+                log_alert(
+                    logger,
+                    YELLOW,
+                    "RLSVI sigma2 empirical-Bayes refit failed; using prior sigma2_rl",
+                    action_type=self.action_type,
+                    user_id=str(user_id),
+                    k=k_cur,
+                    n_finite=sigma2_eb_info.get("n_finite"),
+                    n_ensemble=sigma2_eb_info.get("n_ensemble"),
+                    sigma2=float(sigma2),
+                )
+                params["sigma2_rl_eb_fallback"] = {
+                    "k": k_cur,
+                    **sigma2_eb_info,
+                }
+            elif sigma2_eb_info.get("partial_fallback"):
+                log_alert(
+                    logger,
+                    YELLOW,
+                    "RLSVI sigma2 empirical-Bayes refit partial; averaged finite members only",
+                    action_type=self.action_type,
+                    user_id=str(user_id),
+                    k=k_cur,
+                    n_finite=sigma2_eb_info.get("n_finite"),
+                    n_ensemble=sigma2_eb_info.get("n_ensemble"),
+                    sigma2=float(sigma2),
+                )
+                params.pop("sigma2_rl_eb_fallback", None)
+            else:
+                params.pop("sigma2_rl_eb_fallback", None)
             beta_new, z_new = compute_rlsvi_betas(
                 Phi_rl, targets_rl, mu_0, Sigma_0, sigma2, gamma_bar, z_prev, rng
             )
