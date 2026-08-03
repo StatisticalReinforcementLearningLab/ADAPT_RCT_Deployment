@@ -188,11 +188,7 @@ class Query(ActionHandlerBase):
     def __init__(self, config: dict | None = None):
         self.config = load_config() if config is None else config
 
-    def get_initial_model_params(
-        self,
-        user_id: str,
-        db_reader: DBReader | None = None,
-    ) -> dict:
+    def get_initial_model_params(self, user_id: str) -> dict:
         return {
             "version": 2,
             "user_id": str(user_id),

@@ -757,6 +757,49 @@ def resolve_y1(db_reader: DBReader | None, config: dict, user_id: str) -> float:
     )
 
 
+def ensure_baseline_y1_in_model_params(
+    model_params: dict,
+    db_reader: DBReader | None,
+    config: dict,
+    user_id: str,
+    *,
+    std_params: dict | None = None,
+) -> dict:
+    """Seed ``b_hat_hist[0]`` and PF particles from observed baseline CAE ``Y_1``.
+
+    ``get_initial_model_params`` has no ``db_reader``, so baseline CAE is left
+    unset at enrollment and filled on the first Monday-night update path
+    (``prepare_for_update`` / ``update``), when ``Y_1`` is available.
+    """
+    from RL_agents.rl.standardization import standardize_cae
+
+    params = model_params
+    W = int(params["W"])
+    J = int(params["J"])
+    b_hat_hist = none_to_nan_array(params.get("b_hat_hist"), shape=(W + 1,))
+    b_tilde_hist = none_to_nan_array(params.get("b_tilde_hist"), shape=(W + 1,))
+    y_hat = none_to_nan_array(params.get("pf_y_hat"), shape=(J, 1))
+    needs_b_hat = not np.isfinite(b_hat_hist[0])
+    needs_pf = not np.all(np.isfinite(y_hat))
+    if not needs_b_hat and not needs_pf:
+        return params
+
+    Y_1 = resolve_y1(db_reader, config, user_id)
+    if std_params is not None:
+        Y_1 = float(standardize_cae(Y_1, std_params))
+
+    if needs_b_hat:
+        b_hat_hist[0] = Y_1
+        params["b_hat_hist"] = jsonable_float_array(b_hat_hist)
+    if not np.isfinite(b_tilde_hist[0]):
+        b_tilde_hist[0] = 0.0
+        params["b_tilde_hist"] = jsonable_float_array(b_tilde_hist)
+    if needs_pf:
+        params["pf_y_hat"] = jsonable_float_array(np.full((J, 1), float(Y_1)))
+        params["pf_v_hat"] = jsonable_float_array(np.full(J, 1.0 / float(J)))
+    return params
+
+
 def infer_p_rl(state: dict) -> int:
     """Infer RLSVI feature dimension from the state produced by ``make_state``."""
     _, d, t = state_index(state)

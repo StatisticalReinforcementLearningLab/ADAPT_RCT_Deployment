@@ -24,6 +24,10 @@ a direct per-decision observation lookup (not the full-week PF series):
 - ``E_w``: stored value ``rl_E_w`` (weekly EW update)
 - ``b_hat``, ``b_tilde``: stored beliefs (``rl_b_hat`` / ``rl_b_tilde``);
   at baseline week ``w=1``, missing ``b_hat`` falls back to observed ``Y_1``
+  (``make_state`` has ``db_reader``; enrollment init does not)
+
+Baseline CAE ``Y_1`` is read from observations on the Monday-night update path
+(``prepare_for_update`` / ``update``), not in ``get_initial_model_params``.
 
 Study week ``w`` is 1-indexed (``w=1`` is enrollment / baseline). Array indexing
 inside this handler uses ``k = w - 1``.
@@ -69,7 +73,6 @@ from RL_agents.rl.ew_helpers import (
 from RL_agents.rl.pf_helpers import (
     action_ids_for_pf_reward,
     infer_pf_packet_k,
-    initial_pf_state,
     latest_pf_packet,
     prepare_belief_fallback,
     resolve_pf_priors,
@@ -100,6 +103,7 @@ from RL_agents.rl.other_helpers import (
     jsonable_int_array,
     model_params_from_reader,
     apply_decision_covariates,
+    ensure_baseline_y1_in_model_params,
     lookup_decision_covariates,
     optional_state_index,
     overlay_observation_covariates_on_state,
@@ -232,11 +236,7 @@ class RL(ActionHandlerBase):
         seed = self.config.get("seed")
         return stable_seed(user_id) if seed is None else int(seed)
 
-    def get_initial_model_params(
-        self,
-        user_id: str,
-        db_reader: DBReader | None = None,
-    ) -> dict:
+    def get_initial_model_params(self, user_id: str) -> dict:
         W = int(required_config(self.config, "W"))
         B = int(required_config(self.config, "B"))
         epsilon_0 = float(required_config(self.config, "epsilon_0"))
@@ -262,14 +262,13 @@ class RL(ActionHandlerBase):
 
         A_hist = np.zeros((W, self.n_rl_days, self.n_rl_slots), dtype=int)
         pi_A_hist = np.full((W, self.n_rl_days, self.n_rl_slots), np.nan, dtype=float)
+        # Baseline CAE Y_1 is not available at enrollment (no db_reader here).
+        # Seed b_hat_hist[0] / PF particles on the first Monday-night update.
         b_hat_hist = np.full(W + 1, np.nan, dtype=float)
         b_tilde_hist = np.full(W + 1, np.nan, dtype=float)
-        # Baseline internal week k=0 (public w=1): anchor both PF particles and
-        # b_hat_hist on the participant's observed baseline CAE Y_1.
-        Y_1 = resolve_y1(db_reader, self.config, user_id)
-        b_hat_hist[0] = Y_1
         b_tilde_hist[0] = 0.0
-        pf_state = initial_pf_state(J=J, Y_1=Y_1)
+        pf_y_hat = np.full((J, 1), np.nan, dtype=float)
+        pf_v_hat = np.full(J, 1.0 / float(J), dtype=float)
 
         return {
             "version": 1,
@@ -296,8 +295,8 @@ class RL(ActionHandlerBase):
             "b_hat_hist": jsonable_float_array(b_hat_hist),
             "b_tilde_hist": jsonable_float_array(b_tilde_hist),
             "pf_prior_source": self.pf_prior_source,
-            "pf_y_hat": pf_state["y_hat"],
-            "pf_v_hat": pf_state["v_hat"],
+            "pf_y_hat": jsonable_float_array(pf_y_hat),
+            "pf_v_hat": jsonable_float_array(pf_v_hat),
             "sigma2_MY": (
                 list(map(float, self.pf_priors.get("sigma2_MY", [1.0, 1.0])))
                 if self.pf_priors
@@ -578,6 +577,15 @@ class RL(ActionHandlerBase):
                     if packet.get("pf_data") is None:
                         raise KeyError("PF packet must include pf_data")
                     params = deepcopy(model_params)
+                    # Y_1 is unavailable at enrollment; seed PF / b_hat_hist[0]
+                    # here on the first Monday-night update.
+                    ensure_baseline_y1_in_model_params(
+                        params,
+                        db_reader,
+                        self.config,
+                        user_id,
+                        std_params=self.std_params,
+                    )
                     rng = self._rng(params)
                     pf_update, b_hat_pf, b_tilde_pf = update_pf_belief(
                         model_params=params,
@@ -689,6 +697,15 @@ class RL(ActionHandlerBase):
         db_reader: DBReader,
     ) -> UpdateResult:
         params = deepcopy(model_params)
+        # Seed baseline CAE Y_1 into b_hat_hist[0] / PF particles if still unset
+        # (enrollment init has no db_reader).
+        ensure_baseline_y1_in_model_params(
+            params,
+            db_reader,
+            self.config,
+            user_id,
+            std_params=self.std_params,
+        )
         W = int(params["W"])
         B = int(params["B"])
         A_hist, pi_A_hist, b_hat_hist, b_tilde_hist = history_arrays(
