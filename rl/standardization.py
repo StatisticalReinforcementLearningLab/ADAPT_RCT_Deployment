@@ -64,13 +64,39 @@ def _standardize_my_cell(value: Any, col: int, std: dict) -> Any:
     return float(value)
 
 
+def standardize_pageview_count(value: Any, std: dict) -> Any:
+    """Hourly page-view count -> model scale.
+
+    Current artifacts (``HourlyPageviewCount_zero_count`` present) use the
+    testbed convention ``log(x)`` for ``x > 0`` and ``log(zero_count)`` for
+    zero, then z-score. Legacy artifacts without that key use ``log(x + 1)``.
+    """
+    if _is_missing(value):
+        return value
+    zc = std.get("HourlyPageviewCount_zero_count")
+    if zc is None:
+        return _zscore_raw_count(
+            value, std, "HourlyPageviewCount_shift", "HourlyPageviewCount_scale"
+        )
+    x = float(value)
+    if x < 0:
+        raise ValueError(f"negative page-view count {x!r}")
+    logged = np.log(x) if x > 0 else np.log(float(zc))
+    return float(
+        (logged - float(std["HourlyPageviewCount_shift"]))
+        / float(std["HourlyPageviewCount_scale"])
+    )
+
+
+def uses_legacy_pageview_transform(std: dict) -> bool:
+    return std.get("HourlyPageviewCount_zero_count") is None
+
+
 def _standardize_me_cell(value: Any, col: int, std: dict) -> Any:
     if _is_missing(value):
         return value
     if col in _ME_PAGEVIEW_COLS:
-        return _zscore_raw_count(
-            value, std, "HourlyPageviewCount_shift", "HourlyPageviewCount_scale"
-        )
+        return standardize_pageview_count(value, std)
     # Binary wear / survey indicators stay on the raw {0, 1} scale.
     return float(value)
 
@@ -157,16 +183,16 @@ def standardize_me_matrix(M_E: Any, std: dict) -> np.ndarray:
     )
 
 
-def standardize_c_vector(C: Any, std: dict) -> np.ndarray:
-    """Standardize one length-9 RLSVI/PF context vector (raw deployment scale).
+def standardize_c_vector(C: Any, std: dict, *, pad_value: float = np.nan) -> np.ndarray:
+    """Standardize one 6-entry server context vector (raw deployment scale).
 
     ``C[0]`` yesterday steps: ``log1p`` + z; ``C[1]`` EMA steps: z;
-    ``C[2]`` prior-2h steps: ``log1p`` + z; ``C[5]`` recent burden: z.
-    Remaining entries (fractions / binary) are left unchanged.
+    ``C[2]`` prior-2h steps: ``log1p`` + z; ``C[4]`` recent burden: z.
+    ``C[3]`` / ``C[5]`` (fractions) are left unchanged.
     """
     c = np.asarray(C, dtype=float).ravel()
-    out = np.zeros(9, dtype=float)
-    m = min(int(c.size), 9)
+    out = np.full(6, float(pad_value), dtype=float)
+    m = min(int(c.size), 6)
     if m:
         out[:m] = c[:m]
     if not _is_missing(out[0]):
@@ -181,9 +207,9 @@ def standardize_c_vector(C: Any, std: dict) -> np.ndarray:
         out[2] = _zscore_raw_count(
             out[2], std, "prior2hour_step_count_shift", "prior2hour_step_count_scale"
         )
-    if not _is_missing(out[5]):
-        out[5] = _zscore_value(
-            out[5], std, "recent_burden_shift", "recent_burden_scale"
+    if not _is_missing(out[4]):
+        out[4] = _zscore_value(
+            out[4], std, "recent_burden_shift", "recent_burden_scale"
         )
     return out
 
@@ -213,7 +239,8 @@ def standardize_pf_series(series: dict[str, Any], std: dict) -> dict[str, Any]:
     )
     for idx in np.ndindex(C.shape[:3]):
         if filled[idx]:
-            C[idx] = standardize_c_vector(C[idx], std)
+            # PF design rows keep the legacy zero padding for absent entries.
+            C[idx] = standardize_c_vector(C[idx], std, pad_value=0.0)
     out["C"] = C
     out["C_filled"] = filled
 

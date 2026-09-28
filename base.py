@@ -64,6 +64,9 @@ class UpdatePrepResult:
 class UpdateResult:
     model_params: dict
     stored_values: list[StoredValue] | None = None
+    # Structured outcome of the update (ok flag, reason code, diagnostics).
+    # The framework should persist it with the UpdateRecord.
+    status: dict | None = None
 
 
 @dataclass

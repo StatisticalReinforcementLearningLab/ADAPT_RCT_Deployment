@@ -17,6 +17,7 @@ not define a standalone web server or command-line application.
 ```text
 RL_agents/
 |-- base.py                     # Shared dataclasses and ActionHandlerBase API
+|-- seed_salt.py                # Secret randomization salt (RL and query)
 |-- logging_config.py           # JSON structured logging helpers
 |-- query/
 |   |-- Query.py                # Weekly query decision handler
@@ -24,16 +25,19 @@ RL_agents/
 `-- rl/
     |-- RL.py                   # Walking-suggestion RLSVI handler
     |-- algorithm_helpers.py    # Feature construction and RLSVI math
-    |-- pf_packet_builder.py    # Build PF packets from db_reader series
-    |-- pf_helpers.py           # Particle-filter belief updates
+    |-- week_data.py            # Observations/actions -> per-week arrays (+ C imputation)
+    |-- pf.py                   # Particle filter (port of the testbed PF)
     |-- ew_helpers.py           # Perceived-utility (E_w) pooled-linear update
     |-- prior_helpers.py        # Prior loading helpers
     |-- other_helpers.py        # State, indexing, serialization, slot lookup
     |-- standardization.py      # Observation → model-scale transforms
     |-- config.json             # RL policy settings
-    |-- rl_priors.json          # PF + base Q priors (`pf`, `q_no_td_modify`)
+    |-- rl_priors.json          # PF priors (`pf`); its legacy 79-d Q block is not used
     |-- std_params.json         # Standardization parameters
-    `-- Ew_pooled_linear_coefs.json  # Perceived-utility (E_w) weights
+    `-- Ew_pooled_linear_coefs.json  # e_hat weights (testbed format)
+|-- tests/
+    |-- harness.py              # in-memory framework used by the tests
+    `-- test_rl_v6.py           # unit, parity, and end-to-end tests
 ```
 
 ## Runtime Requirements
@@ -169,266 +173,176 @@ ActionResult(
 
 ## Walking-Suggestion RL Handler
 
-Import path:
+Import path: `from RL_agents.rl import RL`.
 
-```python
-from RL_agents.rl import RL
-```
+The handler implements the validated simulation arm
+**`rl_v6_invariant_redistributed`**: RLSVI with learned within-week reward
+redistribution of the potential-shaped weekly target.
 
-The RL handler uses an ensemble RLSVI policy for binary walking-suggestion
-actions:
-
-- `action = 1`: send a walking suggestion
-- `action = 0`: do not send a walking suggestion
-
-At study week `w = 1`, the handler randomizes with probability `0.5`. After that,
-it computes the ensemble probability that action `1` has greater value than
-action `0`, then clips that probability to `[epsilon_0, 1 - epsilon_0]`.
-
-If `availability` is false, `get_action` returns `A = 0` with probability `0`
-(no randomization).
+- `action = 1` send a walking suggestion, `0` do not.
+- Study week `w = 1`: fixed randomization with probability 0.5.
+- Later weeks: share of the B = 50 ensemble members preferring action 1,
+  clipped to `[epsilon_0, 1 - epsilon_0]`.
+- Unavailable decision (`availability` false): `A = 0`, `action_prob = 0.0`,
+  `random_state.unavailable = true` (monitoring must not treat this as an
+  out-of-range probability).
 
 ### Config (`rl/config.json`)
 
-| Key | Default | Role |
-|-----|---------|------|
-| `W` | `36` | Study weeks |
-| `n_rl_days` / `n_rl_slots` | `6` / `2` | Decision grid (must match feature layout) |
-| `B` | `50` | RLSVI ensemble size |
-| `epsilon_0` | `0.1` | Randomization clip |
-| `gamma_bar` | `0.5` | Discount / noise persistence |
-| `target_update_C` | `1` | Target-network update period |
-| `p_rl` | `77` | Feature dimension (validated at runtime) |
-| `standardize_context` | `true` | Model-scale raw observation fields |
-| `use_default_priors` | `false` | Q uses N(0,I); PF keeps structure with zero means |
-| `pf_refit_sigma2` | `false` | Empirical-Bayes PF noise refit |
-| `rl_prior_path` | `rl_priors.json` | Single prior file (`pf` + `q_no_td_modify`) |
-| `y_1_observation_type` | `rl_Y_1` | Baseline CAE observation type |
-| Stored-value types | `rl_b_hat`, `rl_b_tilde`, `rl_pf_state`, `rl_E_w` | Beliefs / PF / E_w |
+| Key | Value | Role |
+|-----|-------|------|
+| `W` | 36 | Study weeks |
+| `n_rl_days` / `n_rl_slots` | 6 / 2 | Decision grid |
+| `B` | 50 | Ensemble size |
+| `epsilon_0` | 0.1 | Probability clip |
+| `gamma_bar` | 0.9 | Week-boundary discount (1 within the week) and AR(1) exploration persistence |
+| `target_update_C` | 1 | Target-network period (weeks) |
+| `p_rl` | 27 | Feature dimension (checked at start-up) |
+| `q_prior_mode` | `default` | Q prior N(0, I). `file` loads a prior whose `feature_names` must equal `phi_action_feature_names()` |
+| `redistribution_prior_mode` | `default` | Stage-1/2 priors N(0, I), noise variance 1 |
+| `sigma2_rl` | 1.0 | Initial TD noise variance (empirical-Bayes refit each week) |
+| `std_params_path` | `std_params.json` | Standardization artifact (copied from the testbed) |
+| `ew_coefs_path` | `Ew_pooled_linear_coefs.json` | e_hat coefficients (copied from the testbed) |
+| `rl_prior_path` | `rl_priors.json` | PF working-model priors (`pf` block) |
+| `J_particles` | 200 | Particle count (the testbed simulations used 50) |
+| `pf_refit_sigma2` | `true` | Empirical-Bayes refit of the PF noise variances each week (as in the testbed) |
+| `require_seed_salt` | `true` | Refuse to start without a randomization salt |
+| `seed_salt_path` | `seed_salt.local` | Salt file (git-ignored), used when `ADAPT_SEED_SALT` is not set |
 
-### RL State Inputs (`make_state`)
+**Randomization salt** (`RL_agents/seed_salt.py`, shared with the query
+handler). Each Bernoulli draw uses a seed hashed from
+`[salt, user_id, w, d, t]`, so allocations cannot be predicted from participant
+IDs. Lookup order: environment variable `ADAPT_SEED_SALT` (use this on the
+server), then `seed_salt.local`, then config `seed` (legacy). At least 16
+characters; a missing salt stops start-up. The salt is never logged or stored;
+its fingerprint is stored in `model_params["seed_salt_fingerprint"]` and in
+every `random_state`. If the running salt differs from the one a participant
+was enrolled with, decisions continue and `RL_SEED_SALT_CHANGED` (red) is
+logged. A salt was generated in `RL_agents/seed_salt.local`: copy it to the
+server's `ADAPT_SEED_SALT`, keep a secure backup, and never change it during
+the study.
 
-Request `context` is intentionally thin: decision identity + MRT eligibility.
-Features and beliefs are **not** read from context.
+### Feature map (27-d, identical to the testbed)
 
-```python
-context = {
-    "decision_time": "2026-07-13T09:00:00-04:00",
-    "timezone": "America/New_York",
-    "availability": True,
-}
-
-# Test / legacy fallback when no timestamp is provided:
-# context = {"w": 2, "d": 0, "t": 0, "availability": True}
+```
+phi = [1, d_n, t_n, E_w, b_hat, b_tilde]                 # 6
+    + [EWMA of AA, SC, PV, FW, PJ visible before (d,t)]  # 5
+    + C (5-d)                                            # 5
+    + A * [1, E_w, b_hat, b_tilde, C, d_n, t_n]           # 11
 ```
 
-`(w, d, t)` resolution:
+`d_n` = Saturday indicator, `t_n` = afternoon indicator. The EWMA weights sit on
+calendar positions; missing measurements are skipped, never zero-filled.
+`C` (5-d) is taken from the server's 6-entry context (all but the 7-day EMA,
+which only the PF fourSC model uses).
 
-1. Preferred: `decision_time` + `timezone` + `participantinfo` enrollment date
-   (Mon–Sat RL days; slot from wakeup+1h / wakeup+6h when wakeup is present,
-   else local hour `< 14` → morning)
-2. Fallback: explicit `w` / `d`/`day` / `t`/`slot`
+### Weekly schedule
 
-Covariates / beliefs from `db_reader` via `lookup_decision_covariates`
-(per-decision lookup — **not** the full-week PF series):
+| When | Call | What it uses / does |
+|------|------|---------------------|
+| Monday AM / PM decisions of week k | `make_state` / `get_action` | belief, e_hat and policy of week k-1 (expected; not flagged as stale) |
+| Monday night, after Monday's two decisions | `prepare_for_update`, then `update` | PF and e_hat for week k (from the Sunday survey), then RLSVI + V6 refit |
+| Tuesday–Saturday decisions | `make_state` / `get_action` | belief, e_hat and policy of week k |
 
-| Field | Source |
-|-------|--------|
-| `C` | observation / `retrieved_data` for the current `(w, d, t)` slot |
-| `M_Y`, `M_E` | week-`w` observation matrices |
-| `E_w` | stored value `rl_E_w` |
-| `b_hat`, `b_tilde` | stored values `rl_b_hat` / `rl_b_tilde` |
+Both calls read `retrieved_data["model_params"]` and
+`retrieved_data["update_week"]` (1-indexed current week), or `update_time` +
+`timezone`. `make_state` records the expected input week
+(`inputs.expected_input_week` = k-1 on Monday, k otherwise) and the tag of the
+values it used; staleness is measured against that expectation.
 
-Baseline week `w = 1`: missing `b_hat` → observed `Y_1`; missing `b_tilde` /
-`E_w` → `0.0`. Missing slot `C` zeros out with a yellow alert.
+Difference from the testbed: the simulation runs the PF at the start of week k,
+so its Monday decisions already see `b_hat_k`, `e_k`. In deployment Monday uses
+the week k-1 values. Training states for Monday slots still use the week-k
+values (the testbed state definition), so only the two Monday action
+probabilities are affected.
 
-When `standardize_context` is true, looked-up `C` / `M_Y` / `M_E` are
-model-scaled in `apply_decision_covariates` (same transforms as the update
-path).
+1. `prepare_for_update(user_id, db_reader)`
+   - runs e_hat, then the particle filter, **for every week not yet filtered, in
+     order** (a missed or crashed week is caught up, never skipped);
+   - e_hat: `e_k = c0 + c_E e_{k-1} + c_PV PV_{k-1} + c_FW FW_{k-1} + c_PJ PJ_{k-1} + c_J J_k + c_U J_k(U1+U2)/14`
+     (Mon–Sat means of week k-1; check-in of the survey that opens week k);
+   - PF: the testbed working models (fourSC 20-d, antic 15-d, CAE transition 4-d,
+     short CAE 2-d) with the testbed `pf` priors, per-particle posteriors,
+     multinomial resampling at ESS < J/2, empirical-Bayes noise refit;
+   - stores the tagged values and `rl_pf_state` (particles, weights, variances,
+     RNG state, report).
+2. `update(user_id, model_params, actions, rewards, db_reader)`
+   - applies the prepared state only if its week, base PF state and version match;
+   - fits Stage 1 (daily AA/FW/PJ), Stage 1b (slot step count) and Stage 2
+     (weekly target `b_hat_{k+1} + gamma_bar e_{k+1} - e_k` on summed
+     redistribution features incl. the realized page view);
+   - builds TD rows from slot rewards `chi' eta`, refits sigma2 (empirical
+     Bayes on the ensemble-mean target) and draws the ensemble;
+   - **validates** the candidate (finite, not saturated, bounded change) and
+     only then sets `active_policy_key = k`;
+   - reruns for the same week return `already_updated_for_week` unchanged;
+   - returns `UpdateResult.status` (also appended to `model_params["update_log"]`).
 
-Serialized state includes `w`, `d`, `t`, `availability`, `E_w`, `C`, `M_Y`,
-`M_E`, `b_hat`, `b_tilde`, `p_rl`. Action-time state is kept for **action
-selection replicability**; weekly PF / RLSVI training re-reads covariates from
-observations.
+Training states are rebuilt from observations for every slot, so a slot with no
+decision record (no suggestion delivered) enters as `A = 0` and the week keeps
+its credit chain. Unavailable slots likewise enter as `A = 0`. Only weeks with no
+data at all are excluded. Missing realized page views in the Stage-2 features
+are set to 0 (model-scale centre) and counted in
+`status["training"]["realized_pv_imputed_slots"]`.
 
-### Q Features (`p_rl = 77`)
+### Data contract
 
-`build_phi_action` builds a 77-dimensional feature map. Week matrices are stored
-as `(6, 3)` and `(6, 4)`, then **raveled and slot-masked** before they enter φ:
+- **Label = opening week.** The Sunday survey at the end of week w-1 carries
+  `w`: `J_w`, `U1`, `U2`, `I_w`, `Y` / `Y_tilde`. It gates week-w mediators and
+  is the CAE `Y_w` in the paper. `Y_1` (`rl_Y_1`, baseline) is required.
+- Send `Y_tilde` in every completed survey, including full-CAE weeks
+  (`I_w = 1`); the cumulative short-CAE model uses those rows.
+- `I_w` / `J_w` not reported are treated as unknown, never as 1.
+- Sunday is not collected, so the Monday-morning step-count lag in the fourSC
+  model is 0 (as in the testbed).
+- Observations are merged in `server_timestamp` order; exact duplicates (same
+  `observation_id`) are ignored; for conflicting values the latest wins.
+- **Decision context `C`: 6 entries, raw scale, in this order** (vectors of any
+  other length are rejected and treated as missing):
 
-| Block | Dim | Notes |
-|-------|-----|-------|
-| State base | 10 | intercept, time, `E_w`, `b_hat`, `b_tilde` + interactions |
-| `M_Y` | **18** | `(6,3)` → flatten; per day: fourSC AM/PM, anticipated affect |
-| `M_E` | **24** | `(6,4)` → flatten; per day: pageview AM/PM, wear, daily survey |
-| `C` | 8 | current-slot context (RLSVI length; PF packs optional 9th wear) |
-| Action interactions | 17 | `A` × {1, `E_w`, `b_hat`, time, `C`, …} — **not** × mediators |
-| **Total** | **77** | |
+  | Index | Field | Used by |
+  |-------|-------|---------|
+  | 0 | `yesterdayStepCount` | RLSVI, PF |
+  | 1 | `stepCountLast7DaysEma` | PF only |
+  | 2 | `prior2HourStepCount` | RLSVI, PF |
+  | 3 | `activeDaysLast7Days` (fraction) | RLSVI, PF |
+  | 4 | `activitySuggestionsSentLast7Days` (recent burden) | RLSVI, PF |
+  | 5 | `activitySuggestionInteractLast7Days` (fraction) | RLSVI, PF |
 
-At decision `(d, t)`, `_mask_mediators_for_slot` zeros mediators not yet
-observed (slot-level cols need `(day, slot) < (d, t)`; day-level cols need
-`day < d`). So early-week decisions see mostly zero mediator features even
-though the matrices are full-week shaped.
+**Missing context `C` at a decision** is imputed per entry, then flagged
+(`RL_C_IMPUTED`, green):
 
-### Minimal Action-Time Example
+| Entry | Rule |
+|-------|------|
+| `C[0]` yesterday steps | mean over the previous 7 days |
+| `C[2]` prior-2h steps | mean of the same slot over the previous 7 days |
+| `C[1]`, `C[3]`–`C[5]` (7-day summaries) | last observed value |
 
-```python
-state_result = rl_handler.make_state("participant-001", context, db_reader)
-action_result = rl_handler.get_action(
-    "participant-001",
-    state_result.state,
-    rl_params,
-)
-```
+Only if an entry has no history does the decision fall back to the safe policy
+(`RL_C_MISSING`).
 
-### RL Update Flow
+### Failure containment
 
-The deployment framework typically calls updates in two phases.
+| Situation | Behaviour | Alert code |
+|-----------|-----------|------------|
+| Context `C` with a length other than 6 | treated as missing (then imputed) | `RL_C_BAD_LENGTH` (yellow) |
+| Context `C` missing, imputable | RL decision on imputed C | `RL_C_IMPUTED` (green) |
+| Context `C` missing, no history | safe policy pi = 0.5 | `RL_C_MISSING` (yellow) |
+| Other non-finite feature | safe policy | `RL_FEATURES_NONFINITE` (red) |
+| Belief / e_hat or policy one week older than expected | RL decision, flagged | `RL_STALE_ONE_WEEK` (yellow) |
+| Belief / e_hat two or more weeks older than expected | safe policy | `RL_STALE_INPUTS` (red) |
+| Validated policy two or more weeks older than expected | safe policy | `RL_STALE_POLICY` (red) |
+| `model_params` from another package version | safe policy | `RL_VERSION_MISMATCH` (red) |
+| Feature-dimension mismatch | safe policy | `RL_FEATURE_DIMENSION` (red) |
+| Unexpected exception in `get_action` | safe policy | `RL_ACTION_UNEXPECTED_ERROR` (red) |
+| Update cannot train / validation fails | last validated policy kept | `RL_UPDATE` status (yellow) |
+| Update raises | params unchanged except status | `RL_UPDATE_FAILED` (red) |
+| Conflicting action records for one slot | earliest kept | red log in `update` |
+| `Y_1` missing at w = 1 | decision fails loudly | `RL_BASELINE_MISSING` (red) |
+| prepare incomplete (PF/e_hat stopped) | stored report lists `pf_stop` | `RL_PREPARE` (yellow) |
 
-1. `prepare_for_update(...)`
-
-   - reads rewards from observations (`action_id` + `reward` / `CAE` / `cae`)
-   - builds a PF packet from observation-sourced series
-     (`build_pf_packet_from_reader`; optional pre-assembled `rl_pf_packet` /
-     `pf_packet` with `pf_data` still accepted when standardization is off)
-   - runs the particle-filter belief update; assigns belief mean `b_hat` as the
-     weekly reward
-   - builds / updates perceived utility `E_w` and stores `rl_E_w`
-   - returns rewards, stored belief / PF / `E_w` values
-
-2. `update(...)`
-
-   - ingest actions into `A_hist` / `pi_A_hist` / `state_hist`
-   - **rebuild** training-state `C` / `M_Y` / `M_E` from observations
-     (`collect_pf_week_series` + `collect_ew_week_sources`), keeping
-     action-time `E_w` / `b_hat` / `b_tilde`
-   - apply prepared PF beliefs to `b_hat_hist` / `b_tilde_hist`
-   - gate RLSVI on finite `b_hat_hist[k_cur]` and stored `E_w`
-   - refit `sigma2` (empirical Bayes; yellow alert + prior fallback if needed)
-     and RLSVI ensemble → `betas_store[str(k_cur)]`
-
-Week indexing example: finishing action week `k = 2` (`w = 3`) →
-`max_k_seen = 2`, `k_cur = 3`, PF packet belief week `k = 3`, new ensemble in
-`betas_store["3"]`.
-
-## Data Contract (PF packet + E_w)
-
-`prepare_for_update` builds PF design matrices (`pf_data`) from general-name
-series in `db_reader` via `pf_packet_builder.build_pf_packet_from_reader`.
-
-### Perceived-utility (`E_w`) inputs
-
-Weekly `E_w` uses pooled, no-intercept linear coefficients
-(`Ew_pooled_linear_coefs.json`):
-
-\[
-\widehat e_w
-=
-\omega_1 J_w^{\mathrm{week}}
-+
-\omega_2 J_w^{\mathrm{week}}\frac{U_{w,1}+U_{w,2}}{14}
-+
-\omega_3 \overline M_{w-1}^{E,PJ}
-+
-\omega_4 \overline M_{w-1}^{E,PV}
-+
-\omega_5 \overline M_{w-1}^{E,FW}.
-\]
-
-Built by `ew_helpers.build_ew_inputs_from_reader` from:
-
-1. `M_E` summaries of week `w-1`
-2. Weekly check-in `J_w`, `U1`/`U2` (`Exp-tool-1`/`Exp-tool-2`)
-
-Pre-assembled `ew_inputs` is still accepted (`packet["ew_inputs"]`,
-`payload["ew_inputs"]`, or observation type `rl_ew_inputs`).
-
-| Field | Paper symbol | Source |
-|-------|--------------|--------|
-| `J_w` | \(J_w^{\mathrm{week}}\) | Weekly check-in completed (0/1) |
-| `U1` / `U2` | \(U_{w,1}\), \(U_{w,2}\) | RCT 1–7 helpfulness / pleasantness |
-| `half_J_tool8` | \(J_w(U_{w,1}+U_{w,2})/14\) | Derived when omitted |
-| `PJ_sum` | \(\overline M_{w-1}^{E,PJ}\) | Mean of `M_E[:, 3]` over 7 days |
-| `FW_sum` | \(\overline M_{w-1}^{E,FW}\) | Mean of `M_E[:, 2]` over 7 days |
-| `PV_sum` | \(\overline M_{w-1}^{E,PV}\) | `nansum` of `M_E[:, 0:2]` over 14 slots / 14 |
-
-`M_E` is `(≤7)×4` (cols: pageview AM/PM, wear, daily present). Mon–Sat-only
-matrices are padded with zeros for Sunday. Result stored under `rl_E_w` for
-`make_state`.
-
-### PF / action-time inputs from `db_reader`
-
-| General name | Source | Meaning |
-|--------------|--------|---------|
-| `C` | observation / `retrieved_data` only (**not** action state) | Per-slot covariates; length 9 in PF (wear optional in `C[8]`); RLSVI uses first 8 |
-| `A` | `ActionRecord.action` | Binary walking suggestion |
-| `E_w` | stored `rl_E_w` (action state is soft fallback only) | Perceived utility |
-| `M_Y` / `M^Y` | observation only | `(6,3)`: fourSC slots + anticipated affect |
-| `M_E` / `M^E` | observation / week payload | `(≤7,4)` pageview / wear / daily present |
-| `Exp-tool-1` / `Exp-tool-2` | weekly check-in | RCT tool ratings for `E_w` |
-| `Y` / `CAE` | week payload | Full weekly CAE |
-| `Y_tilde` / `CAE_short` | week payload | Short CAE |
-| `I_w` | week payload | Query arm (1 = full CAE, 0 = short) |
-| `J_w` / `wp` | week payload | Week-present gate |
-| `wear7` *(optional)* | payload | `morningFitbitWearLast7Days` if not in `C[8]` |
-| `antic_covariates` *(optional)* | week payload | Day-level antic covariates |
-| `Y_1` | observation type `rl_Y_1` (or payload `Y_1`) | Baseline CAE |
-
-How the server can send `C`:
-
-1. Per-slot as available — `{w, d, t, C: [9]}`
-2. Week grid — `{w, C: shape (6,2,9)}` or `(12,9)`
-3. Prepare-time batch — `get_retrieved_data()["C"|"rl_C"|"pf_C"]`
-
-Action-time `state["C"]` / mediators are for replicability only; PF and
-`update` re-read observations.
-
-When `standardize_context` is true, `prepare_for_update` rebuilds the PF packet
-with `std_params` and model-scales raw observation fields **before** design
-rows: `C` counts/burden, fourSC `log1p`+z, anticipated affect 1–7→`[-1,1]`,
-CAE / short CAE / `Y_1` z-score, `todayStepCount` `log1p`+z.
-
-#### `C` → fourSC column map
-
-| `C[i]` | Role |
-|--------|------|
-| `C[0]` | yesterdayStepCount |
-| `C[1]` | stepCountLast7DaysEma |
-| `C[2]` | prior2HourStepCount |
-| `C[3]` | activityCompletedLast7Days |
-| `C[4]` | activeDaysLast7Days |
-| `C[5]` | activitySuggestionsSentLast7Days |
-| `C[6]` | salienceMessageSentYesterday |
-| `C[7]` | activitySuggestionInteractLast7Days |
-| `C[8]` | morningFitbitWearLast7Days when `wear7` omitted |
-
-`dayOfWeekNorm` and `decisionTimeSlot` are derived from `(d, t)`.
-
-### Built `pf_data` shapes
-
-Let `N_MED_SLOT = 12` (Mon–Sat × 2), `N_MED_ANTIC_DAY = 6`, and CAE features pad
-to a 7-day calendar (`14` fourSC + `7` antic). `sim_w_prev = k - 1`.
-Mediator index 0 = fourSC (dim 25), index 1 = antic (dim 19). Cumulative arrays
-cover weeks `0 .. sim_w_prev - 1` and are `null` until `k >= 2`.
-
-| Field | Shape | Content |
-|-------|-------|---------|
-| `X_MY_base` | `[ (12, 25), (6, 19) ]` | Mediator design rows (CAE column zeroed) |
-| `cae_delta_MY` | same shapes | Per-particle CAE substitution deltas |
-| `M_Y_obs` | `[ (12,), (6,) ]` | Observed mediators; `NaN` where unobserved |
-| `X_Y_base` | `(24,)` | CAE transition design (AR CAE slot zeroed) |
-| `cae_delta_Y` | `(24,)` | AR-1 CAE column = 1 |
-| `X_tY_base` / `cae_delta_tY` | `(2,)` | Short-CAE design `[1,0]` / `[0,1]` |
-| `cae_all_0` | float | Baseline CAE (`Y_1`) |
-| `sim_w_prev` | int | `k - 1` |
-| cumulative `X_cumul_*` / `y_cumul_*` | (when `k >= 2`) | Complete-case history |
-
-`prepare_for_update` also needs current `model_params` in
-`db_reader.get_retrieved_data()` under one of `model_params`,
-`current_model_params`, or `rl_model_params` to run the PF update.
-
-On build/update failure, the belief-fallback path runs (`b_hat_hist` left unset
-for that week, with a yellow alert).
+Every `ActionResult.random_state` carries `seed`, `pi_hat` (unclipped),
+`policy_key`, `policy_staleness`, input week tags, and `version_id`.
 
 ## DBReader Contract
 
@@ -451,7 +365,16 @@ python -m compileall RL_agents
 python -c "from RL_agents.rl import RL; from RL_agents.query import Query; print('ok')"
 ```
 
-There is no test suite in this package yet. Useful focused checks:
+Test suite (unit, testbed parity, end-to-end through an in-memory framework):
+
+```bash
+cd ..
+python -m unittest discover -s RL_agents/tests -v
+```
+
+The parity tests import the simulation testbed when `RL_agents` sits inside
+`ADAPR-MRT-Testbed`, and check that the feature maps and the V6 TD design
+reproduce the testbed exactly. Previously listed focused checks:
 
 - thin context → `(w, d, t)` + `availability`; covariates from observations
 - deterministic action seeding and unavailable → `A = 0`

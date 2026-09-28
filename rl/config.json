@@ -4,9 +4,9 @@
   "n_rl_slots": 2,
   "B": 50,
   "epsilon_0": 0.1,
-  "gamma_bar": 0.5,
+  "gamma_bar": 0.9,
   "target_update_C": 1,
-  "p_rl": 77,
+  "p_rl": 27,
   "b_hat_stored_value_type": "rl_b_hat",
   "b_tilde_stored_value_type": "rl_b_tilde",
   "pf_state_stored_value_type": "rl_pf_state",
@@ -17,9 +17,11 @@
   "standardize_context": true,
   "std_params_path": "std_params.json",
   "rl_prior_path": "rl_priors.json",
-  "use_default_priors": false,
-  "J_particles": 50,
-  "pf_refit_sigma2": false,
+  "J_particles": 200,
+  "pf_refit_sigma2": true,
   "sigma2_rl": 1.0,
-  "seed": null
+  "q_prior_mode": "default",
+  "redistribution_prior_mode": "default",
+  "require_seed_salt": true,
+  "seed_salt_path": "seed_salt.local"
 }

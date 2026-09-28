@@ -45,6 +45,7 @@ from RL_agents.base import (
     UpdateResult,
 )
 from RL_agents.logging_config import GREEN, RED, YELLOW, get_logger, log_alert
+from RL_agents.seed_salt import resolve_seed_salt
 
 
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.json")
@@ -187,11 +188,16 @@ class Query(ActionHandlerBase):
 
     def __init__(self, config: dict | None = None):
         self.config = load_config() if config is None else config
+        self._salt, self.salt_source, self.salt_fingerprint = resolve_seed_salt(self.config)
+        if self._salt is None:
+            log_alert(logger, RED, "query randomization salt is unset", action_type=self.action_type,
+                      code="RL_SEED_SALT_UNSET")
 
     def get_initial_model_params(self, user_id: str) -> dict:
         return {
             "version": 2,
             "user_id": str(user_id),
+            "seed_salt_fingerprint": self.salt_fingerprint,
         }
 
     def make_state(
@@ -327,7 +333,7 @@ class Query(ActionHandlerBase):
             raise
         force_week = int(self.config.get("force_query_week", 2))
         query_prob = float(self.config.get("query_prob", 0.5))
-        decision_seed = _decision_seed(self.config.get("seed"), user_id, w)
+        decision_seed = _decision_seed(self._salt, user_id, w)
 
         if w == 1:
             log_alert(
@@ -374,7 +380,7 @@ class Query(ActionHandlerBase):
         return ActionResult(
             action=action,
             action_prob=float(action_prob),
-            random_state={"seed": decision_seed},
+            random_state={"seed": decision_seed, "salt_fingerprint": self.salt_fingerprint},
         )
 
     def prepare_for_update(

@@ -1,5 +1,6 @@
 {
   "query_prob": 0.5,
   "force_query_week": 2,
-  "seed": null
+  "require_seed_salt": true,
+  "seed_salt_path": "seed_salt.local"
 }

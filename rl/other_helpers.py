@@ -13,18 +13,45 @@ import numpy as np
 from RL_agents.base import DBReader, StoredValue
 from RL_agents.logging_config import RED, YELLOW, get_logger, log_alert
 from RL_agents.rl.algorithm_helpers import (
+    N_RL_CONTEXT,
     N_RL_DAYS,
+    N_SERVER_C,
     N_RL_SLOTS,
+    P_RL,
     build_phi_action,
     build_rl_context_vector,
-)
-from RL_agents.rl.standardization import (
-    standardize_c_vector,
-    standardize_me_matrix,
-    standardize_my_matrix,
+    rl_context_from_server,
 )
 
 logger = get_logger(__name__)
+
+
+def ordered_observations(db_reader: DBReader | None) -> list:
+    """All observations sorted by server time (then id), exact duplicates removed.
+
+    "Later wins" merges downstream are only well defined on a deterministic
+    order; ``DBReader.get_observations`` does not guarantee one.
+    """
+    if db_reader is None:
+        return []
+    obs = list(db_reader.get_observations() or [])
+    seen: set = set()
+    out = []
+    for o in obs:
+        oid = getattr(o, "observation_id", None)
+        if oid is not None:
+            if oid in seen:
+                continue
+            seen.add(oid)
+        out.append(o)
+
+    def key(o):
+        ts = getattr(o, "server_timestamp", None) or getattr(o, "client_timestamp", None)
+        ts_key = ts.timestamp() if hasattr(ts, "timestamp") else float("-inf")
+        oid = getattr(o, "observation_id", None)
+        return (ts_key, -1 if oid is None else int(oid))
+
+    return sorted(out, key=key)
 
 
 def required_config(config: dict, key: str) -> Any:
@@ -128,54 +155,6 @@ def history_arrays(
     return A_hist, pi_A_hist, b_hat_hist, b_tilde_hist
 
 
-def apply_weekly_rewards_to_belief_hist(
-    rewards: dict[int, float],
-    action_id_to_k: dict[int, int],
-    b_hat_hist: np.ndarray,
-    b_tilde_hist: np.ndarray,
-    *,
-    latest_b_tilde: float | None,
-    action_type: str | None = None,
-    user_id: str | None = None,
-) -> None:
-    """Apply action_id-keyed rewards to ``b_hat_hist[k+1]`` once per completed week.
-
-    The external API keeps ``rewards[action_id]`` for observation joins; this
-    collapses duplicate weekly values from multiple slots in the same week.
-    """
-    by_k: dict[int, float] = {}
-    for action_id, reward in rewards.items():
-        k = action_id_to_k.get(int(action_id))
-        if k is None or k + 1 >= b_hat_hist.size:
-            continue
-        val = float(reward)
-        prev = by_k.get(k)
-        if (
-            prev is not None
-            and prev != val
-            and action_type is not None
-            and user_id is not None
-        ):
-            log_alert(
-                logger,
-                YELLOW,
-                "conflicting weekly rewards for same week; using last",
-                action_type=action_type,
-                user_id=str(user_id),
-                k=k,
-                previous=float(prev),
-                reward=val,
-            )
-        by_k[k] = val
-
-    b_tilde_carry = float(latest_b_tilde) if latest_b_tilde is not None else 0.0
-    for k, reward in by_k.items():
-        b_hat_hist[k + 1] = reward
-        # Without PF, carry the last observed belief uncertainty forward.
-        # PF (if prepared) overrides b_tilde_hist later in update().
-        b_tilde_hist[k + 1] = b_tilde_carry
-
-
 def require_key(state: dict, key: str) -> Any:
     if key not in state or state[key] is None:
         raise KeyError(f"state must include {key!r}")
@@ -206,7 +185,7 @@ def coerce_mediator_matrix(
         raise ValueError(f"{name} must have shape (<= {N_RL_DAYS}, {n_cols})")
     if arr.shape[0] > N_RL_DAYS:
         raise ValueError(f"{name} has {arr.shape[0]} rows; expected at most {N_RL_DAYS}")
-    out = np.zeros((N_RL_DAYS, n_cols), dtype=float)
+    out = np.full((N_RL_DAYS, n_cols), np.nan, dtype=float)
     out[: arr.shape[0], :] = arr
     return out
 
@@ -504,17 +483,23 @@ def coerce_state(raw: dict) -> dict:
 
     if "C" in state:
         C = np.asarray(state["C"], dtype=float).ravel()
+        if C.size != N_RL_CONTEXT:
+            if C.size == N_SERVER_C:
+                C = rl_context_from_server(C)
+            else:
+                raise ValueError(
+                    f"state C must have length {N_RL_CONTEXT} (RL) or {N_SERVER_C} (server), got {C.size}"
+                )
     else:
         context_fields = {
             "yesterdayStepCount": state.get("yesterdayStepCount"),
-            "stepCountLast7DaysEma": state.get("stepCountLast7DaysEma"),
-            "prior2HourStepCountAgent": state.get("prior2HourStepCountAgent"),
-            "activityCompletedLast7Days": state.get("activityCompletedLast7Days"),
+            "prior2HourStepCount": state.get(
+                "prior2HourStepCount", state.get("prior2HourStepCountAgent")
+            ),
             "activeDaysLast7Days": state.get("activeDaysLast7Days"),
             "activitySuggestionsSentLast7Days": state.get(
                 "activitySuggestionsSentLast7Days"
             ),
-            "salienceMessageSentYesterday": state.get("salienceMessageSentYesterday"),
             "activitySuggestionInteractLast7Days": state.get(
                 "activitySuggestionInteractLast7Days"
             ),
@@ -556,18 +541,6 @@ def stored_value_payload(stored: StoredValue | None) -> Any:
     return stored.value
 
 
-def stored_float(db_reader: DBReader, stored_value_type: str) -> float | None:
-    if db_reader is None:
-        return None
-    stored = stored_value_payload(db_reader.get_stored_value(stored_value_type))
-    if isinstance(stored, dict):
-        for key in ("value", "b_hat", "b_tilde"):
-            if key in stored:
-                return coerce_optional_float(stored[key])
-        return None
-    return coerce_optional_float(stored)
-
-
 def model_params_from_reader(db_reader: DBReader) -> dict | None:
     """Read current RL model parameters from ``db_reader.get_retrieved_data()``."""
     if db_reader is None:
@@ -586,80 +559,6 @@ DEFAULT_PF_STATE_STORED_VALUE_TYPE = "rl_pf_state"
 DEFAULT_PF_STATE_HISTORY_STORED_VALUE_TYPE_PREFIX = "rl_pf_state_week"
 
 
-def belief_stored_values(
-    config: dict,
-    user_id: str,
-    b_hat: float,
-    b_tilde: float,
-) -> list[StoredValue]:
-    return [
-        StoredValue(
-            user_id=str(user_id),
-            type=str(
-                config.get(
-                    "b_hat_stored_value_type",
-                    DEFAULT_B_HAT_STORED_VALUE_TYPE,
-                )
-            ),
-            value=float(b_hat),
-        ),
-        StoredValue(
-            user_id=str(user_id),
-            type=str(
-                config.get(
-                    "b_tilde_stored_value_type",
-                    DEFAULT_B_TILDE_STORED_VALUE_TYPE,
-                )
-            ),
-            value=float(b_tilde),
-        ),
-    ]
-
-
-def pf_state_stored_values(
-    config: dict,
-    user_id: str,
-    *,
-    packet: dict,
-    pf_update: dict,
-    b_hat: float,
-    b_tilde: float,
-    rng_state: dict,
-) -> list[StoredValue]:
-    k = int(packet["k"])
-    value = {
-        "k": k,
-        "b_hat": float(b_hat),
-        "b_tilde": float(b_tilde),
-        "pf_update": pf_update,
-        "rng_state": rng_state,
-    }
-    latest_type = str(
-        config.get(
-            "pf_state_stored_value_type",
-            DEFAULT_PF_STATE_STORED_VALUE_TYPE,
-        )
-    )
-    history_prefix = str(
-        config.get(
-            "pf_state_history_stored_value_type_prefix",
-            DEFAULT_PF_STATE_HISTORY_STORED_VALUE_TYPE_PREFIX,
-        )
-    )
-    return [
-        StoredValue(
-            user_id=str(user_id),
-            type=latest_type,
-            value=value,
-        ),
-        StoredValue(
-            user_id=str(user_id),
-            type=f"{history_prefix}_{k}",
-            value=value,
-        ),
-    ]
-
-
 def stored_pf_state(config: dict, db_reader: DBReader) -> dict | None:
     if db_reader is None:
         return None
@@ -674,31 +573,6 @@ def stored_pf_state(config: dict, db_reader: DBReader) -> dict | None:
     if stored is None or not isinstance(stored.value, dict):
         return None
     return stored.value
-
-
-def stored_belief(
-    config: dict, db_reader: DBReader
-) -> tuple[float | None, float | None]:
-    return (
-        stored_float(
-            db_reader,
-            str(
-                config.get(
-                    "b_hat_stored_value_type",
-                    DEFAULT_B_HAT_STORED_VALUE_TYPE,
-                )
-            ),
-        ),
-        stored_float(
-            db_reader,
-            str(
-                config.get(
-                    "b_tilde_stored_value_type",
-                    DEFAULT_B_TILDE_STORED_VALUE_TYPE,
-                )
-            ),
-        ),
-    )
 
 
 DEFAULT_Y1_OBSERVATION_TYPE = "rl_Y_1"
@@ -726,10 +600,8 @@ def y1_from_reader(
         return None
     obs_type = y1_observation_type(config)
     uid = str(user_id)
-    try:
-        observations = db_reader.get_observations() or []
-    except TypeError:
-        observations = db_reader.get_observations
+    observations = ordered_observations(db_reader)
+    values: list[float] = []
     for obs in observations:
         obs_uid = getattr(obs, "user_id", None)
         if obs_uid is not None and str(obs_uid) != uid:
@@ -741,63 +613,33 @@ def y1_from_reader(
         if value is None:
             continue
         try:
-            return float(value)
+            val = float(value)
         except (TypeError, ValueError):
             continue
-    return None
+        if np.isfinite(val):
+            values.append(val)
+    if not values:
+        return None
+    if len(set(values)) > 1:
+        log_alert(
+            logger,
+            YELLOW,
+            "multiple distinct baseline Y_1 observations; using the latest",
+            user_id=uid,
+            values=values,
+        )
+    return values[-1]
 
 
 def resolve_y1(db_reader: DBReader | None, config: dict, user_id: str) -> float:
     """Baseline CAE ``Y_1`` from observations, falling back to config."""
     observed = y1_from_reader(db_reader, config, user_id)
-    return (
-        float(observed)
-        if observed is not None
-        else float(config.get("Y_1", 0.0))
-    )
-
-
-def ensure_baseline_y1_in_model_params(
-    model_params: dict,
-    db_reader: DBReader | None,
-    config: dict,
-    user_id: str,
-    *,
-    std_params: dict | None = None,
-) -> dict:
-    """Seed ``b_hat_hist[0]`` and PF particles from observed baseline CAE ``Y_1``.
-
-    ``get_initial_model_params`` has no ``db_reader``, so baseline CAE is left
-    unset at enrollment and filled on the first Monday-night update path
-    (``prepare_for_update`` / ``update``), when ``Y_1`` is available.
-    """
-    from RL_agents.rl.standardization import standardize_cae
-
-    params = model_params
-    W = int(params["W"])
-    J = int(params["J"])
-    b_hat_hist = none_to_nan_array(params.get("b_hat_hist"), shape=(W + 1,))
-    b_tilde_hist = none_to_nan_array(params.get("b_tilde_hist"), shape=(W + 1,))
-    y_hat = none_to_nan_array(params.get("pf_y_hat"), shape=(J, 1))
-    needs_b_hat = not np.isfinite(b_hat_hist[0])
-    needs_pf = not np.all(np.isfinite(y_hat))
-    if not needs_b_hat and not needs_pf:
-        return params
-
-    Y_1 = resolve_y1(db_reader, config, user_id)
-    if std_params is not None:
-        Y_1 = float(standardize_cae(Y_1, std_params))
-
-    if needs_b_hat:
-        b_hat_hist[0] = Y_1
-        params["b_hat_hist"] = jsonable_float_array(b_hat_hist)
-    if not np.isfinite(b_tilde_hist[0]):
-        b_tilde_hist[0] = 0.0
-        params["b_tilde_hist"] = jsonable_float_array(b_tilde_hist)
-    if needs_pf:
-        params["pf_y_hat"] = jsonable_float_array(np.full((J, 1), float(Y_1)))
-        params["pf_v_hat"] = jsonable_float_array(np.full(J, 1.0 / float(J)))
-    return params
+    if observed is None:
+        raise KeyError(
+            f"baseline CAE Y_1 ({y1_observation_type(config)}) is missing for "
+            f"participant {user_id}; it is never defaulted"
+        )
+    return float(observed)
 
 
 def infer_p_rl(state: dict) -> int:
@@ -810,391 +652,6 @@ def infer_p_rl(state: dict) -> int:
 def state_key(k: int, d: int, t: int) -> str:
     """History key using 0-indexed internal week ``k`` (array index)."""
     return f"{int(k)}:{int(d)}:{int(t)}"
-
-
-def _my_matrix_from_pf_series(series: dict[str, Any], k: int) -> np.ndarray | None:
-    """Rebuild ``M_Y`` ``(N_RL_DAYS, 3)`` from PF week series, or ``None`` if empty."""
-    if series is None or k < 0 or k >= int(series.get("n_weeks", 0)):
-        return None
-    four = np.asarray(series["M_Y_fourSC"][k], dtype=float).ravel()
-    antic = np.asarray(series["M_Y_antic"][k], dtype=float).ravel()
-    if not (np.any(np.isfinite(four)) or np.any(np.isfinite(antic))):
-        return None
-    out = np.full((N_RL_DAYS, 3), np.nan, dtype=float)
-    for d in range(N_RL_DAYS):
-        i0 = d * N_RL_SLOTS
-        if i0 < four.size and np.isfinite(four[i0]):
-            out[d, 0] = four[i0]
-        if i0 + 1 < four.size and np.isfinite(four[i0 + 1]):
-            out[d, 1] = four[i0 + 1]
-        if d < antic.size and np.isfinite(antic[d]):
-            out[d, 2] = antic[d]
-    # Missing mediator cells are treated as 0 for RLSVI masking (same as coerce pad).
-    return np.nan_to_num(out, nan=0.0)
-
-
-def _obs_week_index(payload: dict) -> int | None:
-    if payload.get("w") is not None:
-        return internal_week_index(int(payload["w"]))
-    if payload.get("rl_week") is not None:
-        return internal_week_index(int(payload["rl_week"]))
-    if payload.get("week") is not None:
-        return internal_week_index(int(payload["week"]))
-    if payload.get("k") is not None:
-        return int(payload["k"])
-    return None
-
-
-def _obs_day_slot(payload: dict) -> tuple[int | None, int | None]:
-    d = payload.get("d", payload.get("day"))
-    t = payload.get("t", payload.get("slot"))
-    try:
-        d_out = None if d is None else int(d)
-        t_out = None if t is None else int(t)
-    except (TypeError, ValueError):
-        return None, None
-    return d_out, t_out
-
-
-def _c_vector_for_slot(C_value: Any, d: int, t: int) -> np.ndarray | None:
-    """Extract length-9 ``C`` for ``(d, t)`` from a vector or week grid."""
-    if C_value is None:
-        return None
-    C_arr = np.asarray(C_value, dtype=float)
-    n_med = N_RL_DAYS * N_RL_SLOTS
-    if C_arr.ndim == 1:
-        out = np.zeros(9, dtype=float)
-        m = min(int(C_arr.size), 9)
-        if m:
-            out[:m] = C_arr[:m]
-        return out
-    if C_arr.ndim == 3 and C_arr.shape[:2] == (N_RL_DAYS, N_RL_SLOTS):
-        if 0 <= d < N_RL_DAYS and 0 <= t < N_RL_SLOTS:
-            out = np.zeros(9, dtype=float)
-            row = np.asarray(C_arr[d, t], dtype=float).ravel()
-            m = min(int(row.size), 9)
-            if m:
-                out[:m] = row[:m]
-            return out
-        return None
-    if C_arr.ndim == 2 and C_arr.shape[0] == n_med:
-        s = d * N_RL_SLOTS + t
-        if 0 <= s < C_arr.shape[0]:
-            out = np.zeros(9, dtype=float)
-            row = np.asarray(C_arr[s], dtype=float).ravel()
-            m = min(int(row.size), 9)
-            if m:
-                out[:m] = row[:m]
-            return out
-    return None
-
-
-def _my_matrix_from_observation(src: dict) -> np.ndarray | None:
-    """Build ``M_Y`` ``(N_RL_DAYS, 3)`` from an observation payload, or ``None``."""
-    my = src.get("M_Y", src.get("M^Y"))
-    if my is not None:
-        arr = np.asarray(my, dtype=float)
-        if arr.ndim == 2 and arr.shape[1] >= 3:
-            out = np.full((N_RL_DAYS, 3), np.nan, dtype=float)
-            n = min(N_RL_DAYS, arr.shape[0])
-            out[:n, :] = arr[:n, :3]
-            if np.any(np.isfinite(out)):
-                return np.nan_to_num(out, nan=0.0)
-        if arr.ndim == 1 and arr.size >= N_RL_DAYS * N_RL_SLOTS:
-            # Flat fourSC (+ optional antic) — same layout as PF collector.
-            four = arr[: N_RL_DAYS * N_RL_SLOTS]
-            antic = (
-                arr[N_RL_DAYS * N_RL_SLOTS : N_RL_DAYS * N_RL_SLOTS + N_RL_DAYS]
-                if arr.size >= N_RL_DAYS * N_RL_SLOTS + N_RL_DAYS
-                else np.full(N_RL_DAYS, np.nan)
-            )
-            out = np.full((N_RL_DAYS, 3), np.nan, dtype=float)
-            for dd in range(N_RL_DAYS):
-                i0 = dd * N_RL_SLOTS
-                if i0 < four.size:
-                    out[dd, 0] = four[i0]
-                if i0 + 1 < four.size:
-                    out[dd, 1] = four[i0 + 1]
-                if dd < antic.size:
-                    out[dd, 2] = antic[dd]
-            if np.any(np.isfinite(out)):
-                return np.nan_to_num(out, nan=0.0)
-
-    four_src = src.get("stepCountNext4Hour")
-    antic_src = src.get("dailyAnticipatedAffect")
-    if four_src is None and antic_src is None:
-        return None
-    out = np.full((N_RL_DAYS, 3), np.nan, dtype=float)
-    if four_src is not None:
-        four = np.asarray(four_src, dtype=float).ravel()
-        for dd in range(N_RL_DAYS):
-            i0 = dd * N_RL_SLOTS
-            if i0 < four.size and np.isfinite(four[i0]):
-                out[dd, 0] = four[i0]
-            if i0 + 1 < four.size and np.isfinite(four[i0 + 1]):
-                out[dd, 1] = four[i0 + 1]
-    if antic_src is not None:
-        antic = np.asarray(antic_src, dtype=float).ravel()
-        for dd in range(min(N_RL_DAYS, antic.size)):
-            if np.isfinite(antic[dd]):
-                out[dd, 2] = antic[dd]
-    if not np.any(np.isfinite(out)):
-        return None
-    return np.nan_to_num(out, nan=0.0)
-
-
-def _me_matrix_from_observation(src: dict) -> np.ndarray | None:
-    me = src.get("M_E", src.get("M^E"))
-    if me is None:
-        return None
-    arr = np.asarray(me, dtype=float)
-    if arr.ndim != 2 or arr.shape[1] < 4:
-        return None
-    if not np.any(np.isfinite(arr)):
-        return None
-    out = np.zeros((N_RL_DAYS, 4), dtype=float)
-    n = min(N_RL_DAYS, arr.shape[0])
-    out[:n, :] = np.nan_to_num(arr[:n, :4], nan=0.0)
-    return out
-
-
-def lookup_decision_covariates(
-    db_reader: DBReader | None,
-    *,
-    k: int,
-    d: int,
-    t: int,
-) -> dict[str, Any]:
-    """Direct observation lookup for one decision: slot ``C``, week ``M_Y`` / ``M_E``.
-
-    Does **not** scan action-time state or build a full-week PF series. Later
-    matching observations overwrite earlier ones. ``retrieved_data`` keys
-    ``C`` / ``rl_C`` / ``pf_C`` are also accepted for slot ``C``.
-
-    Returns ``{"C": ndarray|None, "M_Y": ndarray|None, "M_E": ndarray|None}``.
-    ``C`` is length 9 (RLSVI uses the first 8); mediators are ``(N_RL_DAYS, *)``.
-    """
-    out: dict[str, Any] = {"C": None, "M_Y": None, "M_E": None}
-    if db_reader is None or not (0 <= d < N_RL_DAYS and 0 <= t < N_RL_SLOTS):
-        return out
-
-    try:
-        observations = db_reader.get_observations() or []
-    except TypeError:
-        observations = db_reader.get_observations or []
-
-    for obs in observations:
-        payload = getattr(obs, "payload", {}) or {}
-        if not isinstance(payload, dict):
-            continue
-        series_payload = payload.get("weekly_series", payload)
-        candidates = [payload]
-        if isinstance(series_payload, dict) and series_payload is not payload:
-            candidates.append(series_payload)
-
-        for src in candidates:
-            if not isinstance(src, dict):
-                continue
-            wk = _obs_week_index(src)
-            if wk is None:
-                wk = _obs_week_index(payload)
-            if wk is None or int(wk) != int(k):
-                continue
-
-            d_slot, t_slot = _obs_day_slot(src)
-            if d_slot is None and t_slot is None:
-                d_slot, t_slot = _obs_day_slot(payload)
-
-            c_value = src.get("C", payload.get("C") if src is not payload else None)
-            if c_value is not None:
-                # Per-slot vector requires matching (d, t); week grids index internally.
-                c_arr = np.asarray(c_value, dtype=float)
-                if c_arr.ndim == 1:
-                    if d_slot == d and t_slot == t:
-                        extracted = _c_vector_for_slot(c_value, d, t)
-                        if extracted is not None:
-                            out["C"] = extracted
-                else:
-                    extracted = _c_vector_for_slot(c_value, d, t)
-                    if extracted is not None:
-                        out["C"] = extracted
-
-            my = _my_matrix_from_observation(src)
-            if my is not None:
-                out["M_Y"] = my
-
-            me = _me_matrix_from_observation(src)
-            if me is not None:
-                out["M_E"] = me
-
-    try:
-        retrieved = db_reader.get_retrieved_data() or {}
-    except Exception:  # noqa: BLE001 - retrieved_data is optional
-        retrieved = {}
-    for key in ("C", "rl_C", "pf_C"):
-        batch_c = retrieved.get(key)
-        if batch_c is None:
-            continue
-        if isinstance(batch_c, dict):
-            for week_key, C_value in batch_c.items():
-                try:
-                    wk = int(week_key)
-                except (TypeError, ValueError):
-                    continue
-                k_batch = internal_week_index(wk) if wk >= 1 else int(wk)
-                if k_batch != int(k):
-                    continue
-                extracted = _c_vector_for_slot(C_value, d, t)
-                if extracted is not None:
-                    out["C"] = extracted
-        else:
-            k_batch = _obs_week_index(retrieved)
-            if k_batch == int(k):
-                extracted = _c_vector_for_slot(batch_c, d, t)
-                if extracted is not None:
-                    out["C"] = extracted
-        break
-
-    return out
-
-
-def apply_decision_covariates(
-    state: dict,
-    *,
-    covariates: dict[str, Any],
-    std_params: dict | None = None,
-) -> dict:
-    """Write looked-up ``C`` / ``M_Y`` / ``M_E`` onto a decision state (optional std)."""
-    out = dict(state)
-    c = covariates.get("C")
-    if c is not None:
-        c_raw = np.asarray(c, dtype=float).ravel()
-        if std_params is not None:
-            c_raw = standardize_c_vector(c_raw, std_params)
-        out["C"] = c_raw[:8]
-
-    my = covariates.get("M_Y")
-    if my is not None:
-        my_arr = np.asarray(my, dtype=float)
-        if std_params is not None:
-            my_arr = standardize_my_matrix(my_arr, std_params)
-        out["M_Y"] = my_arr
-
-    me = covariates.get("M_E")
-    if me is not None:
-        me_arr = np.asarray(me, dtype=float)
-        if std_params is not None:
-            me_arr = standardize_me_matrix(me_arr, std_params)
-        out["M_E"] = me_arr
-
-    return out
-
-
-def overlay_observation_covariates_on_state(
-    state: dict,
-    *,
-    k: int,
-    d: int,
-    t: int,
-    series: dict[str, Any] | None,
-    me_week: Any | None,
-    std_params: dict | None = None,
-) -> dict:
-    """Replace delayed covariates from ``db_reader`` series; keep beliefs / ``E_w``.
-
-    Kept from the action-time state (for RLSVI timing / replicability of beliefs):
-    ``E_w``, ``b_hat``, ``b_tilde``, and the decision index ``(w, d, t)``.
-
-    Overwritten when observation-sourced data exist:
-    ``C`` (from PF series when ``C_filled[k,d,t]``), ``M_Y`` (week mediators),
-    ``M_E`` (week engagement matrix). Raw values are model-scaled when
-    ``std_params`` is provided.
-    """
-    out = dict(state)
-    # Preserve belief fields explicitly even if absent on ``out``.
-    for key in ("E_w", "b_hat", "b_tilde", "perceivedUtility"):
-        if key in state:
-            out[key] = state[key]
-
-    if (
-        series is not None
-        and 0 <= k < int(series.get("n_weeks", 0))
-        and 0 <= d < N_RL_DAYS
-        and 0 <= t < N_RL_SLOTS
-    ):
-        filled = np.asarray(series.get("C_filled"), dtype=bool)
-        if (
-            filled.ndim == 3
-            and k < filled.shape[0]
-            and filled[k, d, t]
-        ):
-            c_raw = np.asarray(series["C"][k, d, t], dtype=float).ravel()
-            if std_params is not None:
-                c_raw = standardize_c_vector(c_raw, std_params)
-            # RLSVI context is length 8; PF series packs optional wear in C[8].
-            out["C"] = c_raw[:8]
-
-        my = _my_matrix_from_pf_series(series, k)
-        if my is not None:
-            if std_params is not None:
-                my = standardize_my_matrix(my, std_params)
-            out["M_Y"] = my
-
-    if me_week is not None:
-        me = np.asarray(me_week, dtype=float)
-        if me.ndim == 2 and me.shape[1] >= 4 and np.any(np.isfinite(me)):
-            me6 = np.zeros((N_RL_DAYS, 4), dtype=float)
-            n = min(N_RL_DAYS, me.shape[0])
-            me6[:n, :] = np.nan_to_num(me[:n, :4], nan=0.0)
-            if std_params is not None:
-                me6 = standardize_me_matrix(me6, std_params)
-            out["M_E"] = me6
-
-    return coerce_state(out)
-
-
-def refresh_state_hist_from_observations(
-    state_hist: dict[str, dict],
-    *,
-    series: dict[str, Any] | None,
-    me_by_k: dict[int, Any] | None,
-    std_params: dict | None = None,
-) -> dict[str, dict]:
-    """Rebuild ``C`` / ``M_Y`` / ``M_E`` on every stored training state from DB series."""
-    me_by_k = me_by_k or {}
-    out: dict[str, dict] = {}
-    for key, payload in state_hist.items():
-        try:
-            state = deserialize_state(payload)
-            w, d, t = state_index(state)
-            k = internal_week_index(w)
-            rebuilt = overlay_observation_covariates_on_state(
-                state,
-                k=k,
-                d=d,
-                t=t,
-                series=series,
-                me_week=(me_by_k.get(k) or {}).get("M_E")
-                if isinstance(me_by_k.get(k), dict)
-                else me_by_k.get(k),
-                std_params=std_params,
-            )
-            out[key] = serialize_state(rebuilt)
-        except (KeyError, TypeError, ValueError):
-            out[key] = payload
-    return out
-
-
-def state_hist_lookup(state_hist: dict[str, dict]):
-    """Build ``get_state(k, d, t)`` for ``build_rl_training_data``."""
-
-    def get_state(k: int, d: int, t: int) -> dict:
-        key = state_key(k, d, t)
-        if key not in state_hist:
-            raise KeyError(f"missing RL state for {key}")
-        return feature_state(deserialize_state(state_hist[key]))
-
-    return get_state
 
 
 def serialize_state(state: dict) -> dict:
@@ -1243,6 +700,10 @@ def validate_feature_dimension(
         if model_params.get("p_rl") is not None
         else len(model_params["mu_0_rl"])
     )
+    if p_model != P_RL:
+        raise ValueError(
+            f"model_params p_rl={p_model} is not this package's feature dimension {P_RL}"
+        )
     if p_state == p_model:
         return
     w, d, t = state_index(state)
@@ -1259,3 +720,25 @@ def validate_feature_dimension(
         p_model=p_model,
     )
     raise ValueError(f"state p_rl={p_state} does not match model p_rl={p_model}")
+
+
+# ---------------------------------------------------------------------------
+# Week-tagged stored values
+# ---------------------------------------------------------------------------
+def tagged_value(k: int, value: Any, **extra: Any) -> dict:
+    return {"k": int(k), "value": value, **extra}
+
+
+def stored_tagged(db_reader: DBReader | None, stored_value_type: str) -> tuple[float | None, int | None]:
+    """Return ``(value, k)`` from a week-tagged stored value.
+
+    Legacy untagged floats return ``k=None`` so callers can treat them as
+    stale-of-unknown-age.
+    """
+    if db_reader is None:
+        return None, None
+    stored = stored_value_payload(db_reader.get_stored_value(stored_value_type))
+    if isinstance(stored, dict):
+        k = stored.get("k")
+        return coerce_optional_float(stored.get("value")), (None if k is None else int(k))
+    return coerce_optional_float(stored), None
