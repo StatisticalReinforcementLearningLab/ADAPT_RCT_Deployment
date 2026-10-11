@@ -261,8 +261,10 @@ probabilities are affected.
      order** (a missed or crashed week is caught up, never skipped);
    - e_hat: `e_k = c0 + c_E e_{k-1} + c_PV PV_{k-1} + c_FW FW_{k-1} + c_PJ PJ_{k-1} + c_J J_k + c_U J_k(U1+U2)/14`
      (Mon–Sat means of week k-1; check-in of the survey that opens week k);
-   - PF: the testbed working models (fourSC 20-d, antic 15-d, CAE transition 4-d,
-     short CAE 2-d) with the testbed `pf` priors, per-particle posteriors,
+   - PF: the testbed working models (fourSC 18-d, antic 13-d, CAE transition 4-d,
+     short CAE 2-d; the action does not interact with any 7-day summary) with
+     the testbed `pf` priors (fourSC/antic currently marginalized from the
+     previous 20/15-d fits; replace with an `est_prior.py` refit), per-particle posteriors,
      multinomial resampling at ESS < J/2, empirical-Bayes noise refit;
    - stores the tagged values and `rl_pf_state` (particles, weights, variances,
      RNG state, report).

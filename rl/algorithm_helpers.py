@@ -59,22 +59,21 @@ EB_SIGMA2_MIN = 1e-4
 EB_SIGMA2_LOG_HALFWIDTH = 8.0
 EB_MAXITER = 200
 
-# Decision-time context sent by the server: 6 entries, raw scale.
-#   0 yesterdayStepCount, 1 stepCountLast7DaysEma, 2 prior2HourStepCount,
-#   3 activeDaysLast7Days, 4 activitySuggestionsSentLast7Days (recent burden),
-#   5 activitySuggestionInteractLast7Days.
-# The PF fourSC model uses all six; the RLSVI context (testbed
-# ``build_rl_context_vector``) uses the 5 below (all but the 7-day EMA).
+# Decision-time context sent by the server: 5 entries, raw scale.
+#   0 yesterdayStepCount, 1 prior2HourStepCount, 2 activeDaysLast7Days,
+#   3 activitySuggestionsSentLast7Days (recent burden),
+#   4 activitySuggestionInteractLast7Days.
+# The PF fourSC model and the RLSVI context (testbed
+# ``build_rl_context_vector``) both use all five.
 SERVER_C_NAMES = (
     "yesterdayStepCount",
-    "stepCountLast7DaysEma",
     "prior2HourStepCount",
     "activeDaysLast7Days",
     "activitySuggestionsSentLast7Days",
     "activitySuggestionInteractLast7Days",
 )
 N_SERVER_C = len(SERVER_C_NAMES)
-RL_C_FROM_SERVER = (0, 2, 3, 4, 5)
+RL_C_FROM_SERVER = (0, 1, 2, 3, 4)
 N_RL_CONTEXT = len(RL_C_FROM_SERVER)
 RL_CONTEXT_NAMES = (
     "yesterday_step_count",
@@ -107,7 +106,7 @@ class NonFiniteFeatures(ValueError):
 # Context and mediator summaries
 # ---------------------------------------------------------------------------
 def rl_context_from_server(c: Any) -> np.ndarray:
-    """Select the 5-d RLSVI context from the 6-d server context.
+    """Select the 5-d RLSVI context from the 5-d server context (same order).
 
     Entries not provided are NaN (never zero-filled).
     """
@@ -407,12 +406,30 @@ def empirical_bayes_sigma2_ensemble(X, targets_per_b, mu_0, Sigma_0, fallback=1.
     return float(s2), info
 
 
-def compute_rlsvi_betas(Phi, targets_per_b, mu_0, Sigma_0, sigma2, gamma_bar, z_prev, rng):
-    """Closed-form RLSVI posterior with AR(1)-discounted ensemble noise.
+def noise_cholesky(Sigma) -> np.ndarray:
+    """Cholesky factor of a symmetrized, eigenvalue-floored covariance."""
+    S = 0.5 * (np.asarray(Sigma, dtype=float) + np.asarray(Sigma, dtype=float).T)
+    min_eig = float(np.linalg.eigvalsh(S).min())
+    if min_eig < 1e-6:
+        S = S + (1e-6 - min_eig) * np.eye(S.shape[0])
+    return np.linalg.cholesky(S)
 
-    Returns ``(betas, z_new, diagnostics)``. Raises on non-finite input rather
+
+def compute_rlsvi_betas(Phi, targets_per_b, mu_0, Sigma_0, sigma2, rho, xi_prev, rng):
+    """Closed-form RLSVI posterior with persistent, standardized ensemble noise.
+
+    Each member keeps a standardized noise state ``xi ~ N(0, I)`` with
+    ``xi_w = rho * xi_{w-1} + sqrt(1 - rho^2) * eps``; the perturbation is
+    ``z_w = L_w xi_w`` with ``L_w L_w^T = Sigma_w``, so every week's
+    perturbation has exactly the posterior covariance. ``rho`` is the
+    persistence; the handler passes the weekly discount ``gamma_bar``.
+
+    Returns ``(betas, xi_new, diagnostics)``. Raises on non-finite input rather
     than letting NaN propagate into the ensemble.
     """
+    rho = float(rho)
+    if not (0.0 <= rho < 1.0):
+        raise ValueError(f"noise persistence must be in [0, 1), got {rho!r}")
     Phi = np.asarray(Phi, dtype=float)
     if not np.all(np.isfinite(Phi)):
         raise ValueError("non-finite rows reached the RLSVI design")
@@ -431,24 +448,22 @@ def compute_rlsvi_betas(Phi, targets_per_b, mu_0, Sigma_0, sigma2, gamma_bar, z_
         inv_info: dict[str, Any] = {}
         Sigma_post = spd_inverse(Sigma_0_inv + (1.0 / sigma2) * (Phi.T @ Phi), inv_info)
         diag["inverse"] = inv_info
-    noise_cov = (1.0 - gamma_bar**2) * Sigma_post
-    noise_cov = 0.5 * (noise_cov + noise_cov.T)
-    min_eig = float(np.linalg.eigvalsh(noise_cov).min())
+    min_eig = float(np.linalg.eigvalsh(0.5 * (Sigma_post + Sigma_post.T)).min())
     diag["noise_min_eig"] = min_eig
     if min_eig < 1e-6:
-        noise_cov += (1e-6 - min_eig) * np.eye(noise_cov.shape[0])
         diag["noise_eig_floor_applied"] = True
     precomp = Sigma_0_inv @ mu_0
-    L = np.linalg.cholesky(noise_cov)
+    L = noise_cholesky(Sigma_post)
+    scale = float(np.sqrt(1.0 - rho * rho))
     betas, z_new = [], []
     for b in range(B):
         if Phi.shape[0] == 0:
             mu_b = np.asarray(mu_0, dtype=float).copy()
         else:
             mu_b = Sigma_post @ (precomp + (1.0 / sigma2) * (Phi.T @ targets_per_b[b]))
-        z_b = gamma_bar * np.asarray(z_prev[b], dtype=float) + L @ rng.standard_normal(L.shape[0])
-        betas.append(mu_b + z_b)
-        z_new.append(z_b)
+        xi_b = rho * np.asarray(xi_prev[b], dtype=float) + scale * rng.standard_normal(L.shape[0])
+        betas.append(mu_b + L @ xi_b)
+        z_new.append(xi_b)
     diag["max_abs_beta"] = float(np.max(np.abs(np.asarray(betas))))
     return betas, z_new, diag
 

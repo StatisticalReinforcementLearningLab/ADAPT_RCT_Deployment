@@ -8,6 +8,8 @@ from typing import Any
 
 import numpy as np
 
+from RL_agents.rl.algorithm_helpers import N_SERVER_C
+
 DEFAULT_STD_PARAMS_PATH = Path(__file__).with_name("std_params.json")
 
 # M_Y columns: fourSC_morning, fourSC_afternoon, anticipated_affect
@@ -67,9 +69,10 @@ def _standardize_my_cell(value: Any, col: int, std: dict) -> Any:
 def standardize_pageview_count(value: Any, std: dict) -> Any:
     """Hourly page-view count -> model scale.
 
-    Current artifacts (``HourlyPageviewCount_zero_count`` present) use the
-    testbed convention ``log(x)`` for ``x > 0`` and ``log(zero_count)`` for
-    zero, then z-score. Legacy artifacts without that key use ``log(x + 1)``.
+    Current artifacts (``HourlyPageviewCount_transform == "log1p"``) and old
+    artifacts without either key use ``log(x + 1)``, then z-score. Artifacts
+    written with ``HourlyPageviewCount_zero_count`` (Sept 2026 testbed) use
+    ``log(x)`` for ``x > 0`` and ``log(zero_count)`` for zero.
     """
     if _is_missing(value):
         return value
@@ -89,6 +92,9 @@ def standardize_pageview_count(value: Any, std: dict) -> Any:
 
 
 def uses_legacy_pageview_transform(std: dict) -> bool:
+    """True for artifacts that predate the explicit page-view transform key."""
+    if std.get("HourlyPageviewCount_transform") == "log1p":
+        return False
     return std.get("HourlyPageviewCount_zero_count") is None
 
 
@@ -184,15 +190,15 @@ def standardize_me_matrix(M_E: Any, std: dict) -> np.ndarray:
 
 
 def standardize_c_vector(C: Any, std: dict, *, pad_value: float = np.nan) -> np.ndarray:
-    """Standardize one 6-entry server context vector (raw deployment scale).
+    """Standardize one 5-entry server context vector (raw deployment scale).
 
-    ``C[0]`` yesterday steps: ``log1p`` + z; ``C[1]`` EMA steps: z;
-    ``C[2]`` prior-2h steps: ``log1p`` + z; ``C[4]`` recent burden: z.
-    ``C[3]`` / ``C[5]`` (fractions) are left unchanged.
+    ``C[0]`` yesterday steps: ``log1p`` + z; ``C[1]`` prior-2h steps:
+    ``log1p`` + z; ``C[3]`` recent burden: z.
+    ``C[2]`` / ``C[4]`` (fractions) are left unchanged.
     """
     c = np.asarray(C, dtype=float).ravel()
-    out = np.full(6, float(pad_value), dtype=float)
-    m = min(int(c.size), 6)
+    out = np.full(N_SERVER_C, float(pad_value), dtype=float)
+    m = min(int(c.size), N_SERVER_C)
     if m:
         out[:m] = c[:m]
     if not _is_missing(out[0]):
@@ -200,16 +206,12 @@ def standardize_c_vector(C: Any, std: dict, *, pad_value: float = np.nan) -> np.
             out[0], std, "yesterday_step_count_shift", "yesterday_step_count_scale"
         )
     if not _is_missing(out[1]):
-        out[1] = _zscore_value(
-            out[1], std, "EMA_step_count_shift", "EMA_step_count_scale"
+        out[1] = _zscore_raw_count(
+            out[1], std, "prior2hour_step_count_shift", "prior2hour_step_count_scale"
         )
-    if not _is_missing(out[2]):
-        out[2] = _zscore_raw_count(
-            out[2], std, "prior2hour_step_count_shift", "prior2hour_step_count_scale"
-        )
-    if not _is_missing(out[4]):
-        out[4] = _zscore_value(
-            out[4], std, "recent_burden_shift", "recent_burden_scale"
+    if not _is_missing(out[3]):
+        out[3] = _zscore_value(
+            out[3], std, "recent_burden_shift", "recent_burden_scale"
         )
     return out
 
@@ -272,7 +274,7 @@ def standardize_context(context: dict, std: dict) -> dict:
 
     - Context counts (``YesterdayStepCount``, ``prior2HourStepCountRaw``, …):
       ``log(x+1)`` then z-score, or z-score only for already-continuous fields
-      (``EMA_StepCount``, ``recentBurdenRaw``).
+      (``recentBurdenRaw``).
     - ``M_Y`` mediators: fourSC columns use ``log(x+1)`` + z-score
       (``4hour_step_count_*``); anticipated affect (deployment 1–7) maps to
       [-1, 1] via ``2*(x-1)/6 - 1``.
@@ -304,18 +306,6 @@ def standardize_context(context: dict, std: dict) -> dict:
             "prior2hour_step_count_shift",
             "prior2hour_step_count_scale",
             True,
-        ),
-        "EMA_StepCount": (
-            "stepCountLast7DaysEma",
-            "EMA_step_count_shift",
-            "EMA_step_count_scale",
-            False,
-        ),
-        "stepCountLast7DaysEmaRaw": (
-            "stepCountLast7DaysEma",
-            "EMA_step_count_shift",
-            "EMA_step_count_scale",
-            False,
         ),
         "recentBurdenRaw": (
             "activitySuggestionsSentLast7Days",

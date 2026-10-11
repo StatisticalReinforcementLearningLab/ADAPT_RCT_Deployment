@@ -103,11 +103,15 @@ def ew_aggregates_from_me(M_E_raw: Any, std: dict) -> dict[str, float]:
             pv[d * N_RL_SLOTS + t] = standardize_pageview_count(v, std) if np.isfinite(v) else np.nan
         fw[d] = me[d, ME_COL_FW]
         pj[d] = me[d, ME_COL_PJ]
+    # A missing page-view slot is a zero count (imputed on the raw scale, as in
+    # the testbed fits), not the standardized centre.
+    n_pv_missing = int(np.sum(~np.isfinite(pv)))
+    pv = np.where(np.isfinite(pv), pv, standardize_pageview_count(0.0, std))
     return {
         "PV_sum": float(np.nansum(pv) / pv.size),
         "FW_sum": float(np.nansum(fw) / fw.size),
         "PJ_sum": float(np.nansum(pj) / pj.size),
-        "n_pv_missing": int(np.sum(~np.isfinite(pv))),
+        "n_pv_missing": n_pv_missing,
         "n_fw_missing": int(np.sum(~np.isfinite(fw))),
         "n_pj_missing": int(np.sum(~np.isfinite(pj))),
     }

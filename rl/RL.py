@@ -53,6 +53,7 @@ from RL_agents.rl.algorithm_helpers import (
     build_v6_training_data,
     clip_prob,
     compute_rlsvi_betas,
+    noise_cholesky,
     empirical_bayes_sigma2_ensemble,
     ensemble_action_prob,
     gamma_dt_matrix,
@@ -189,7 +190,7 @@ class RL(ActionHandlerBase):
             log_alert(
                 logger,
                 YELLOW,
-                "std_params uses the legacy log(x+1) page-view transform; regenerate from the testbed",
+                "std_params has no HourlyPageviewCount_transform key; regenerate from the testbed",
                 action_type=self.action_type,
             )
         self.rl_feature_names = phi_action_feature_names()
@@ -309,9 +310,10 @@ class RL(ActionHandlerBase):
         mu_0, Sigma_0 = self.q_priors["mu_0"], self.q_priors["Sigma_0"]
         initial_seed = stable_seed(json.dumps([self._salt, str(user_id), "init"]))
         rng = np.random.default_rng(initial_seed)
-        L = np.linalg.cholesky(Sigma_0)
-        z0 = [L @ rng.standard_normal(mu_0.size) for _ in range(B)]
-        beta0 = [mu_0 + z for z in z0]
+        # Standardized noise state xi_0 ~ N(0, I); beta_0 = mu_0 + L_0 xi_0.
+        L = noise_cholesky(Sigma_0)
+        z0 = [rng.standard_normal(mu_0.size) for _ in range(B)]
+        beta0 = [mu_0 + L @ xi for xi in z0]
         e_hat_hist = np.full(W + 1, np.nan)
         e_hat_hist[0] = self._e_lag0()
         return {
@@ -797,7 +799,8 @@ class RL(ActionHandlerBase):
                 if not week_ok.get(k, False):
                     full_cache[k] = None
                 else:
-                    M_Y, M_E = data.model_mediators(k, self.std_params)
+                    # Stage-1 response keeps the carried-forward affect (testbed).
+                    M_Y, M_E = data.model_mediators(k, self.std_params, antic="locf")
                     miss = ~np.isfinite(M_E[:, 0:2])
                     pv_imputed["n"] += int(miss.sum())
                     pv = M_E[:, 0:2]
@@ -823,6 +826,7 @@ class RL(ActionHandlerBase):
         status["stage"] = "posterior"
         sigma2, eb_info = empirical_bayes_sigma2_ensemble(Phi, targets, mu_0, Sigma_0, float(params["sigma2_rl"]))
         status["sigma2"] = eb_info
+        # Noise persistence equals the weekly discount.
         betas_new, z_new, post = compute_rlsvi_betas(Phi, targets, mu_0, Sigma_0, sigma2, gamma_bar, z_prev, rng)
         status["posterior"] = post
         if post.get("inverse", {}).get("path") == "pinv":

@@ -168,24 +168,37 @@ class TestParity(unittest.TestCase):
         from RL_agents.rl.pf import antic_row, foursc_row
         rng = np.random.default_rng(5)
         for _ in range(20):
-            c = rng.normal(size=6)  # model-scale server context
+            c = rng.normal(size=5)  # model-scale server context
             d, t, a, pu, lag = int(rng.integers(6)), int(rng.integers(2)), int(rng.integers(2)), rng.normal(), rng.normal()
             tb4 = self.tb.build_fourSC_features(
-                yesterdayStepCount=c[0], stepCountLast7DaysEma=c[1], prior2HourStepCount=c[2],
-                activeDaysLast7Days=c[3], activitySuggestionsSentLast7Days=c[4],
-                activitySuggestionInteractLast7Days=c[5], isWeekend=float(d == 5),
+                yesterdayStepCount=c[0], prior2HourStepCount=c[1],
+                activeDaysLast7Days=c[2], activitySuggestionsSentLast7Days=c[3],
+                activitySuggestionInteractLast7Days=c[4], isWeekend=float(d == 5),
                 decisionTimeSlot=t, perceivedUtility=pu, caeAverageLastWeek=0.0, Ah=a,
                 stepCountNext4HourLag1=lag,
             )
             np.testing.assert_allclose(foursc_row(c, lag1=lag, d=d, t=t, pu=pu, action=a), tb4)
             wm, wa, yest = int(rng.integers(2)), int(rng.integers(2)), rng.normal()
             tba = self.tb.build_antic_features(
-                dailyAnticipatedAffectYesterday=yest, activeDaysLast7Days=c[3], isWeekend=float(d == 5),
-                perceivedUtility=pu, caeAverageLastWeek=0.0, activitySuggestionsSentLast7Days=c[4],
+                dailyAnticipatedAffectYesterday=yest, activeDaysLast7Days=c[2], isWeekend=float(d == 5),
+                perceivedUtility=pu, caeAverageLastWeek=0.0, activitySuggestionsSentLast7Days=c[3],
                 ws_morning=wm, ws_afternoon=wa,
             )
             np.testing.assert_allclose(
-                antic_row(antic_yesterday=yest, active=c[3], d=d, pu=pu, rb=c[4], ws_m=wm, ws_a=wa), tba)
+                antic_row(antic_yesterday=yest, active=c[2], d=d, pu=pu, rb=c[3], ws_m=wm, ws_a=wa), tba)
+
+    def test_pf_cae_row_matches_testbed_with_missing(self):
+        from RL_agents.rl.pf import cae_row
+        import vani_env
+        rng = np.random.default_rng(3)
+        for _ in range(10):
+            f = rng.normal(size=12)
+            a = rng.normal(size=6)
+            f[rng.random(12) < 0.3] = np.nan
+            a[rng.random(6) < 0.5] = np.nan
+            tb = vani_env.build_pf_CAE_features(0.0, f, a)
+            np.testing.assert_allclose(cae_row(f, a), tb)
+        np.testing.assert_allclose(cae_row(np.full(12, np.nan), np.full(6, np.nan))[2:], [0.0, 0.0])
 
     def test_v6_training_data_matches_testbed_construction(self):
         tb = self.tb
@@ -272,7 +285,7 @@ class TestHandler(unittest.TestCase):
         ar = p.decide(2, 2, 0, missing_c=True)
         inp = ar.random_state["inputs"]
         self.assertFalse(inp["C_missing"])
-        self.assertEqual(sorted(inp["C_imputed_indices"]), list(range(6)))
+        self.assertEqual(sorted(inp["C_imputed_indices"]), list(range(5)))
         self.assertIn("pi_hat", ar.random_state)  # RL decision, not the safe policy
 
     def test_unavailable_returns_zero_without_randomization(self):
@@ -465,3 +478,22 @@ class TestSeedSalt(unittest.TestCase):
             os.environ.pop(SALT_ENV_VAR, None)
             if old is not None:
                 os.environ[SALT_ENV_VAR] = old
+
+
+class TestAnticipatedAffectInState(unittest.TestCase):
+    def test_state_uses_only_answered_check_ins(self):
+        from RL_agents.rl.week_data import WeekData
+        from RL_agents.rl.standardization import standardize_anticipated_affect
+        h = handler()
+        data = WeekData(4)
+        data.antic[1, :] = [6.0, np.nan, 2.0, np.nan, np.nan, np.nan]
+        M_Y_obs, _ = data.model_mediators(1, h.std_params)
+        M_Y_locf, _ = data.model_mediators(1, h.std_params, antic="locf")
+        self.assertTrue(np.isnan(M_Y_obs[1, 2]))
+        self.assertEqual(M_Y_locf[1, 2], M_Y_locf[0, 2])
+        # EWMA at Thursday (d=3): calendar positions 0..2, position 1 skipped
+        a0, a2 = standardize_anticipated_affect(6.0), standardize_anticipated_affect(2.0)
+        g = 1 - 1 / 3
+        expected = (g**2 * a0 + a2) / (g**2 + 1)
+        got = ah.summarize_mediators_ewma(M_Y_obs, np.full((6, 4), np.nan), 3, 0)[0]
+        self.assertAlmostEqual(got, expected)

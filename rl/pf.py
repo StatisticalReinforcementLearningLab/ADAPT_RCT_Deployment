@@ -3,7 +3,7 @@
 Working models, identical to the testbed (``algorithm_helpers`` /
 ``ParticleFilterRuntime.update_standard``):
 
-* fourSC (20-d, ``PF_THETA_FOURSC_NAMES``), anticipated affect (15-d,
+* fourSC (18-d, ``PF_THETA_FOURSC_NAMES``), anticipated affect (13-d,
   ``PF_THETA_ANTIC_NAMES``): action-conditional mediator models whose
   ``CAE_avg_lastweek`` column is filled per particle;
 * CAE transition ``[1, CAE_lag, fourSC_ewma, antic_ewma]`` (Mon-Sat EWMAs);
@@ -29,11 +29,10 @@ from RL_agents.rl.algorithm_helpers import N_RL_DAYS, N_RL_SLOTS, N_SERVER_C, em
 from RL_agents.rl.week_data import WeekData
 
 PF_THETA_FOURSC_NAMES = [
-    "intercept", "stepCountNext4HourLag1", "yesterdayStepCount", "stepCountLast7DaysEma",
+    "intercept", "stepCountNext4HourLag1", "yesterdayStepCount",
     "prior2HourStepCount", "activitySuggestionsSentLast7Days", "activitySuggestionInteractLast7Days",
     "activeDaysLast7Days", "isWeekend", "decisionTimeSlot", "perceivedUtilityLastWeek",
     "caeAverageLastWeek", "Ah", "Ah*yesterdayStepCount", "Ah*prior2HourStepCount",
-    "Ah*activitySuggestionsSentLast7Days", "Ah*activitySuggestionInteractLast7Days",
     "Ah*perceivedUtilityLastWeek", "Ah*caeAverageLastWeek", "Ah*decisionTimeSlot",
 ]
 PF_THETA_ANTIC_NAMES = [
@@ -41,9 +40,9 @@ PF_THETA_ANTIC_NAMES = [
     "perceived_utility_lastweek", "CAE_avg_lastweek", "recent_burden", "A0_morning", "A1_afternoon",
     "A0_morning_by_perceived_utility_lastweek", "A1_afternoon_by_perceived_utility_lastweek",
     "A0_morning_by_CAE_avg_lastweek", "A1_afternoon_by_CAE_avg_lastweek",
-    "A0_morning_by_recent_burden", "A1_afternoon_by_recent_burden",
 ]
-PF_DIMS = {"fourSC": 20, "antic": 15, "CAE": 4, "CAE_short": 2}
+# The action does not interact with any 7-day summary in either mediator model.
+PF_DIMS = {"fourSC": 17, "antic": 13, "CAE": 4, "CAE_short": 2}
 _F = {n: i for i, n in enumerate(PF_THETA_FOURSC_NAMES)}
 _A = {n: i for i, n in enumerate(PF_THETA_ANTIC_NAMES)}
 _CAE_AR1_COL = 1
@@ -57,14 +56,13 @@ class PFStateMismatch(RuntimeError):
 # Design rows
 # ---------------------------------------------------------------------------
 def foursc_row(c_model: np.ndarray, *, lag1: float, d: int, t: int, pu: float, action: float) -> np.ndarray:
-    """Testbed ``build_fourSC_features`` from the 6-entry model-scale context."""
-    ysc, ema, p2h = c_model[0], c_model[1], c_model[2]
-    active, sug, inter = c_model[3], c_model[4], c_model[5]
+    """Testbed ``build_fourSC_features`` from the 5-entry model-scale context."""
+    ysc, p2h, active, sug, inter = (c_model[i] for i in range(5))
     wkend = 1.0 if d >= N_RL_DAYS - 1 else 0.0
     a = float(action)
     return np.array([
-        1.0, lag1, ysc, ema, p2h, sug, inter, active, wkend, float(t), pu, 0.0,
-        a, a * ysc, a * p2h, a * sug, a * inter, a * pu, 0.0, a * float(t),
+        1.0, lag1, ysc, p2h, sug, inter, active, wkend, float(t), pu, 0.0,
+        a, a * ysc, a * p2h, a * pu, 0.0, a * float(t),
     ], dtype=float)
 
 
@@ -80,7 +78,7 @@ def antic_row(*, antic_yesterday: float, active: float, d: int, pu: float, rb: f
     wkend = 1.0 if d >= N_RL_DAYS - 1 else 0.0
     return np.array([
         1.0, antic_yesterday, active, wkend, pu, 0.0, rb, ws_m, ws_a,
-        ws_m * pu, ws_a * pu, 0.0, 0.0, ws_m * rb, ws_a * rb,
+        ws_m * pu, ws_a * pu, 0.0, 0.0,
     ], dtype=float)
 
 
@@ -92,17 +90,9 @@ def antic_cae_delta(x: np.ndarray) -> np.ndarray:
     return delta
 
 
-def _fill_mean(x: np.ndarray) -> np.ndarray:
-    x = np.asarray(x, dtype=float)
-    if np.all(np.isfinite(x)):
-        return x
-    fin = x[np.isfinite(x)]
-    return np.where(np.isfinite(x), x, float(fin.mean()) if fin.size else 0.0)
-
-
 def cae_row(foursc12: np.ndarray, antic6: np.ndarray) -> np.ndarray:
-    """``[1, 0, EWMA(fourSC Mon-Sat), EWMA(antic Mon-Sat)]`` (NaN -> week mean)."""
-    return np.array([1.0, 0.0, ewma_gamma(_fill_mean(foursc12)), ewma_gamma(_fill_mean(antic6))])
+    """``[1, 0, EWMA(fourSC Mon-Sat), EWMA(antic Mon-Sat)]`` (missing entries skipped; 0 if none)."""
+    return np.array([1.0, 0.0, ewma_gamma(foursc12), ewma_gamma(antic6)])
 
 
 class PFDesign:
@@ -159,11 +149,12 @@ class PFDesign:
             yest = self.antic_vis[k, d - 1]
             yest = float(yest) if np.isfinite(yest) else 0.0
         c = self.c[k, d, 0]
-        return antic_row(antic_yesterday=yest, active=c[3], d=d, pu=float(self.e_hat[k]), rb=c[4],
+        return antic_row(antic_yesterday=yest, active=c[2], d=d, pu=float(self.e_hat[k]), rb=c[3],
                          ws_m=self.data.A[k, d, 0], ws_a=self.data.A[k, d, 1])
 
     def cae_row(self, sw):
-        return cae_row(self.four[sw].ravel(), self.antic_vis[sw])
+        # Answered check-ins only; missing entries skipped (as in the RL state).
+        return cae_row(self.four[sw].ravel(), self.antic_obs[sw])
 
     def build(self, k: int) -> dict[str, Any]:
         """PF inputs for the belief update of ``Y_k`` (testbed ``build_pf_data``)."""
@@ -197,8 +188,9 @@ class PFDesign:
                     x = self.antic_row(sw, d)
                     if np.isfinite(y) and np.all(np.isfinite(x)):
                         ax.append(x); ad.append(antic_cae_delta(x)); aw.append(sw); ay.append(y)
-            data["X_cumul_MY_base"] = [np.array(fx).reshape(-1, 20), np.array(ax).reshape(-1, 15)]
-            data["cae_delta_cumul_MY"] = [np.array(fd).reshape(-1, 20), np.array(ad).reshape(-1, 15)]
+            pf_, pa_ = PF_DIMS["fourSC"], PF_DIMS["antic"]
+            data["X_cumul_MY_base"] = [np.array(fx).reshape(-1, pf_), np.array(ax).reshape(-1, pa_)]
+            data["cae_delta_cumul_MY"] = [np.array(fd).reshape(-1, pf_), np.array(ad).reshape(-1, pa_)]
             data["week_idx_cumul_MY"] = [np.array(fw, dtype=int), np.array(aw, dtype=int)]
             data["y_cumul_MY"] = [np.array(fy), np.array(ay)]
             data["X_cumul_Y_base"] = np.array([self.cae_row(sw) for sw in range(sw_prev)])
@@ -363,6 +355,10 @@ def load_pf_priors_v2(payload: dict) -> dict:
     for key, dim in PF_DIMS.items():
         if key not in pf or len(pf[key]["nu_0"]) != dim:
             raise ValueError(f"PF prior {key} must have dimension {dim} (testbed working models)")
+    for key, names in (("fourSC", PF_THETA_FOURSC_NAMES), ("antic", PF_THETA_ANTIC_NAMES)):
+        got = pf[key].get("names")
+        if got is not None and list(got) != names:
+            raise ValueError(f"PF prior {key} columns do not match the working model: {got}")
     arr = lambda v: np.asarray(v, dtype=float)  # noqa: E731
     return {
         "nu_0_MY": [arr(pf["fourSC"]["nu_0"]), arr(pf["antic"]["nu_0"])],

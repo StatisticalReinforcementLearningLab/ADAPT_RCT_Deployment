@@ -78,11 +78,10 @@ class Participant:
 
     # data generation ----------------------------------------------------
     def _slot_context(self, k, d, t, missing_c=False):
-        # server context: yesterday steps, 7-day EMA steps, prior-2h steps,
+        # server context: yesterday steps, prior-2h steps,
         # active-day fraction, suggestions sent (7d), interaction fraction
         c = [
             float(self.rng.integers(2000, 9000)),
-            float(self.rng.integers(3000, 7000)),
             float(self.rng.integers(0, 1500)),
             float(self.rng.uniform(0, 1)),
             float(self.rng.integers(0, 10)),

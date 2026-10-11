@@ -6,7 +6,7 @@ handling, labelling, and imputation are defined once.
 
 Labelling contract (0-indexed ``k`` = study week ``w - 1``):
 
-* per-slot payload ``{"w", "d", "t", "C": [6]}``: decision context of that slot
+* per-slot payload ``{"w", "d", "t", "C": [5]}``: decision context of that slot
   (layout ``algorithm_helpers.SERVER_C_NAMES``; other lengths are rejected);
 * week payload ``{"w", "M_Y": 6x3, "M_E": 6x4}`` (or ``stepCountNext4Hour`` /
   ``dailyAnticipatedAffect``): mediators observed during week ``w``;
@@ -43,12 +43,12 @@ from RL_agents.rl.standardization import (
     standardize_pageview_count,
 )
 
-# Server context C (6 entries, see algorithm_helpers.SERVER_C_NAMES). Entries
+# Server context C (5 entries, see algorithm_helpers.SERVER_C_NAMES). Entries
 # imputed by the mean of the previous 7 days (point measures) vs. carried
 # forward (rolling 7-day summaries).
 C_MEAN_7D_DAILY = (0,)      # yesterday's step count (one value per day)
-C_MEAN_7D_SAME_SLOT = (2,)  # prior-2-hour step count (same slot, previous 7 days)
-C_LOCF = (1, 3, 4, 5)       # 7-day EMA, active days, burden, interaction
+C_MEAN_7D_SAME_SLOT = (1,)  # prior-2-hour step count (same slot, previous 7 days)
+C_LOCF = (2, 3, 4)          # active days, burden, interaction
 
 
 def _set_context(data: "WeekData", slot: tuple, arr: np.ndarray) -> None:
@@ -169,21 +169,26 @@ class WeekData:
                 flat[i] = last
         return flat.reshape(self.antic.shape)
 
-    def model_mediators(self, k: int, std: dict) -> tuple[np.ndarray, np.ndarray]:
+    def model_mediators(self, k: int, std: dict, *, antic: str = "observed") -> tuple[np.ndarray, np.ndarray]:
         """Model-scale ``(M_Y (6,3), M_E (6,4))`` for week ``k`` (NaN = missing).
 
-        Anticipated affect uses the agent-visible LOCF series, as in the testbed.
+        ``antic="observed"`` (decision states): only answered check-ins; a
+        day without an answer stays NaN and is skipped by the within-week EWMA.
+        ``antic="locf"``: last answered value carried forward (Stage-1 response,
+        as in the testbed).
         """
+        if antic not in ("observed", "locf"):
+            raise ValueError(f"antic must be 'observed' or 'locf', got {antic!r}")
         M_Y = np.full((N_RL_DAYS, 3), np.nan)
         M_E = np.full((N_RL_DAYS, 4), np.nan)
-        antic = self.antic_locf()
+        antic_arr = self.antic_locf() if antic == "locf" else self.antic
         for d in range(N_RL_DAYS):
             for t in range(N_RL_SLOTS):
                 v = self.foursc[k, d, t]
                 M_Y[d, t] = standardize_foursc_count(v, std) if np.isfinite(v) else np.nan
                 p = self.pv[k, d, t]
                 M_E[d, t] = standardize_pageview_count(p, std) if np.isfinite(p) else np.nan
-            a = antic[k, d]
+            a = antic_arr[k, d]
             M_Y[d, 2] = standardize_anticipated_affect(a) if np.isfinite(a) else np.nan
             M_E[d, 2] = self.wear[k, d]
             M_E[d, 3] = self.pj[k, d]
